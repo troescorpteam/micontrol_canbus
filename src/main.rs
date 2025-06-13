@@ -10,7 +10,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, interval};
 
 // Standard CAN constants (missing from socketcan crate)
@@ -20,6 +20,17 @@ const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 lazy_static! {
     pub static ref GLOBAL_MESSAGE_DATA: Arc<RwLock<HashMap<u32, MessageData>>> =
         Arc::new(RwLock::new(HashMap::new()));
+}
+
+// Global mpsc channel for sending CAN frames to be transmitted
+lazy_static! {
+    pub static ref CAN_TX_CHANNEL: (
+        mpsc::UnboundedSender<CanFrame>,
+        Arc<RwLock<Option<mpsc::UnboundedReceiver<CanFrame>>>>
+    ) = {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (tx, Arc::new(RwLock::new(Some(rx))))
+    };
 }
 
 // Structure to store message signals and their current values
@@ -207,6 +218,12 @@ async fn main() -> Result<()> {
 
     let mut socket_rx = CanSocket::open(&can_interface).unwrap();
 
+    // Take the receiver from the global channel
+    let mut can_tx_receiver = {
+        let mut receiver_lock = CAN_TX_CHANNEL.1.write().await;
+        receiver_lock.take().expect("CAN TX receiver already taken")
+    };
+
     // Read DBC file and create message data storage
     let mut f = File::open(&dbc_file).await?;
     let mut buffer = Vec::new();
@@ -235,6 +252,7 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
+            // Handle incoming CAN frames
             socket_result = socket_rx.next() => {
                 match socket_result {
                     Some(Ok(frame)) => {
@@ -255,6 +273,22 @@ async fn main() -> Result<()> {
                     None => break,
                 }
             }
+            // Handle outgoing CAN frames from the channel
+            frame_to_send = can_tx_receiver.recv() => {
+                match frame_to_send {
+                    Some(frame) => {
+                        if let Err(e) = socket_rx.write_frame(frame).await {
+                            eprintln!("Failed to send CAN frame: {}", e);
+                        } else {
+                            println!("Sent CAN frame: {:02x?}", frame.data());
+                        }
+                    }
+                    None => {
+                        eprintln!("CAN TX channel closed");
+                        break;
+                    }
+                }
+            }
             _ = print_timer.tick() => {
                 println!("\n========== CAN Signal Values ==========");
                 {
@@ -267,26 +301,35 @@ async fn main() -> Result<()> {
                 println!("=======================================\n");
 
                 // Demonstrate frame construction by modifying PhaseSequence
-                if let Ok((can_id, frame)) = construct_frame_with_signal(
+                match construct_frame_with_signal(
                     "StatusGridMonitorLoc",
                     "PhaseSequence",
                     1.0  // Set PhaseSequence to 1.0
                 ).await {
-                    println!("Constructed frame for PhaseSequence modification:");
-                    println!("CAN ID: 0x{:08x}", can_id);
-                    match frame.id() {
-                        socketcan::Id::Standard(id) => {
-                            println!("Frame ID (Standard): 0x{:03x}", id.as_raw());
+                    Ok((can_id, frame)) => {
+                        println!("Constructed frame for PhaseSequence modification:");
+                        println!("CAN ID: 0x{:08x}", can_id);
+                        match frame.id() {
+                            socketcan::Id::Standard(id) => {
+                                println!("Frame ID (Standard): 0x{:03x}", id.as_raw());
+                            }
+                            socketcan::Id::Extended(id) => {
+                                println!("Frame ID (Extended): 0x{:08x}", id.as_raw());
+                            }
                         }
-                        socketcan::Id::Extended(id) => {
-                            println!("Frame ID (Extended): 0x{:08x}", id.as_raw());
+                        println!("Frame data: {:02x?}", frame.data());
+
+                        // Send the frame
+                        if let Err(e) = write_frame(frame) {
+                            println!("Failed to send frame: {}", e);
+                        } else {
+                            println!("Frame sent successfully");
                         }
+                        println!("-------------------------------------------\n");
                     }
-                    println!("Frame data: {:02x?}", frame.data());
-                    // socket_rx.write_frame(frame).await?;
-                    println!("-------------------------------------------\n");
-                } else {
-                    println!("Failed to construct frame for PhaseSequence\n");
+                    Err(e) => {
+                        println!("Failed to construct frame for PhaseSequence: {}\n", e);
+                    }
                 }
             }
         }
@@ -318,23 +361,12 @@ async fn construct_frame_with_signal(
     Ok((*can_id, frame))
 }
 
-// Helper function to construct frame by CAN ID with modified signal value
-async fn construct_frame_with_signal_by_id(
-    can_id: u32,
-    signal_name: &str,
-    new_value: f32,
-) -> Result<CanFrame, String> {
-    let mut message_data = GLOBAL_MESSAGE_DATA.write().await;
-
-    let msg_data = message_data
-        .get_mut(&can_id)
-        .ok_or_else(|| format!("Message with CAN ID 0x{:08x} not found", can_id))?;
-
-    // Set the new signal value
-    msg_data.set_signal_value(signal_name, new_value)?;
-
-    // Construct the frame
-    msg_data.construct_frame(can_id)
+/// Write a CAN frame to the socket
+pub fn write_frame(frame: CanFrame) -> Result<(), String> {
+    CAN_TX_CHANNEL
+        .0
+        .send(frame)
+        .map_err(|e| format!("Failed to send CAN frame: {}", e))
 }
 
 #[cfg(test)]
@@ -520,7 +552,7 @@ mod tests {
         // due to missing DBC or CAN interface in test environment
 
         // We can test that the functions handle missing messages correctly
-        let result = construct_frame_with_signal_by_id(0x12345678, "TestSignal", 1.0).await;
+        let result = construct_frame_with_signal("NonExistentMessage", "TestSignal", 1.0).await;
         assert!(result.is_err(), "Should fail when message doesn't exist");
 
         let error_msg = result.unwrap_err();
