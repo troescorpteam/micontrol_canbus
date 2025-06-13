@@ -268,11 +268,10 @@ async fn main() -> Result<()> {
 
                 // Demonstrate frame construction by modifying PhaseSequence
                 if let Ok((can_id, frame)) = construct_frame_with_signal(
-                    &mut *GLOBAL_MESSAGE_DATA.write().await,
                     "StatusGridMonitorLoc",
                     "PhaseSequence",
                     1.0  // Set PhaseSequence to 1.0
-                ) {
+                ).await {
                     println!("Constructed frame for PhaseSequence modification:");
                     println!("CAN ID: 0x{:08x}", can_id);
                     match frame.id() {
@@ -297,12 +296,13 @@ async fn main() -> Result<()> {
 }
 
 // Helper function to find a message by name and construct a frame with modified signal value
-fn construct_frame_with_signal(
-    message_data: &mut HashMap<u32, MessageData>,
+async fn construct_frame_with_signal(
     message_name: &str,
     signal_name: &str,
     new_value: f32,
 ) -> Result<(u32, CanFrame), String> {
+    let mut message_data = GLOBAL_MESSAGE_DATA.write().await;
+
     // Find the message by name
     let (can_id, msg_data) = message_data
         .iter_mut()
@@ -319,12 +319,13 @@ fn construct_frame_with_signal(
 }
 
 // Helper function to construct frame by CAN ID with modified signal value
-fn construct_frame_with_signal_by_id(
-    message_data: &mut HashMap<u32, MessageData>,
+async fn construct_frame_with_signal_by_id(
     can_id: u32,
     signal_name: &str,
     new_value: f32,
 ) -> Result<CanFrame, String> {
+    let mut message_data = GLOBAL_MESSAGE_DATA.write().await;
+
     let msg_data = message_data
         .get_mut(&can_id)
         .ok_or_else(|| format!("Message with CAN ID 0x{:08x} not found", can_id))?;
@@ -512,17 +513,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_frame_construction_helper_functions() {
+    #[tokio::test]
+    async fn test_frame_construction_helper_functions() {
         // Test the helper functions without requiring a real CAN interface
-        let mut message_data: HashMap<u32, MessageData> = HashMap::new();
-
         // This test verifies the logic of the helper functions even if we can't test actual frame construction
         // due to missing DBC or CAN interface in test environment
 
         // We can test that the functions handle missing messages correctly
-        let result =
-            construct_frame_with_signal_by_id(&mut message_data, 0x12345678, "TestSignal", 1.0);
+        let result = construct_frame_with_signal_by_id(0x12345678, "TestSignal", 1.0).await;
         assert!(result.is_err(), "Should fail when message doesn't exist");
 
         let error_msg = result.unwrap_err();
@@ -576,12 +574,8 @@ mod tests {
                 MessageData::new(msg.message_name().clone(), msg.signals().clone()),
             );
 
-            let result = construct_frame_with_signal(
-                &mut message_data,
-                "StatusGridMonitorLoc",
-                "PhaseSequence",
-                1.0,
-            );
+            let result =
+                construct_frame_with_signal("StatusGridMonitorLoc", "PhaseSequence", 1.0).await;
 
             match result {
                 Ok((returned_can_id, frame)) => {
