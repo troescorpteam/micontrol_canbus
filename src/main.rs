@@ -3,6 +3,9 @@ use can_dbc::{ByteOrder, Signal};
 use dotenv::dotenv;
 use futures::StreamExt;
 use lazy_static::lazy_static;
+use micontrol_canbus::CAN_TX_SENDER;
+use micontrol_canbus::{SignalUpdatePayload, set_signal_update_sender};
+use serde::{Deserialize, Serialize};
 use socketcan::{CanFrame, EmbeddedFrame, ExtendedId, Id, StandardId, tokio::CanSocket};
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -11,7 +14,8 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{RwLock, mpsc};
-use tokio::time::{Duration, interval};
+
+mod mqtt_integration;
 
 // Standard CAN constants (missing from socketcan crate)
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
@@ -22,21 +26,54 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
 }
 
-// Global mpsc channel for sending CAN frames to be transmitted
-lazy_static! {
-    pub static ref CAN_TX_CHANNEL: (
-        mpsc::UnboundedSender<CanFrame>,
-        Arc<RwLock<Option<mpsc::UnboundedReceiver<CanFrame>>>>
-    ) = {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (tx, Arc::new(RwLock::new(Some(rx))))
-    };
+// Global Redis connection
+static REDIS_CLIENT: tokio::sync::OnceCell<redis::Client> = tokio::sync::OnceCell::const_new();
+
+// Initialize Redis client
+async fn init_redis() -> Result<()> {
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let client = redis::Client::open(redis_url)?;
+
+    // Test connection
+    let mut conn = client.get_connection()?;
+    let _: String = redis::cmd("PING").query(&mut conn)?;
+
+    REDIS_CLIENT
+        .set(client)
+        .map_err(|_| anyhow::anyhow!("Failed to initialize Redis client - already initialized"))?;
+
+    println!("Redis connection initialized successfully");
+    Ok(())
+}
+
+// Get Redis connection
+async fn get_redis_connection() -> Result<redis::Connection> {
+    let client = REDIS_CLIENT
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Redis client not initialized"))?;
+    Ok(client.get_connection()?)
+}
+
+// Store signal value in Redis hash epc_canbus with key as messagename_signalname
+async fn store_signal_in_redis(message_name: &str, signal_name: &str, value: f32) -> Result<()> {
+    let mut conn = get_redis_connection().await?;
+    let hash_key = "epc_canbus";
+    let field_key = format!("{}_{}", message_name, signal_name);
+
+    let _: () = redis::cmd("HSET")
+        .arg(hash_key)
+        .arg(&field_key)
+        .arg(value)
+        .query(&mut conn)?;
+
+    Ok(())
 }
 
 // Structure to store message signals and their current values
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageData {
     name: String,
+    #[serde(skip)] // Skip Signal as it may not be serializable
     signals: Vec<Signal>,
     signal_values: HashMap<String, f32>,
 }
@@ -55,7 +92,9 @@ impl MessageData {
         }
     }
 
-    fn update_from_frame(&mut self, frame: &CanFrame) {
+    fn update_from_frame(&mut self, frame: &CanFrame) -> Vec<(String, f32)> {
+        let mut changed_signals = Vec::new();
+
         for signal in &self.signals {
             let frame_data: [u8; 8] = frame
                 .data()
@@ -74,9 +113,20 @@ impl MessageData {
                 * *signal.factor() as f32
                 + *signal.offset() as f32;
 
-            self.signal_values
-                .insert(signal.name().clone(), calculated_value);
+            // Check if the value has changed
+            let current_value = self
+                .signal_values
+                .get(signal.name())
+                .copied()
+                .unwrap_or(0.0);
+            if (calculated_value - current_value).abs() > f32::EPSILON {
+                changed_signals.push((signal.name().clone(), calculated_value));
+                self.signal_values
+                    .insert(signal.name().clone(), calculated_value);
+            }
         }
+
+        changed_signals
     }
 
     fn get_signal_value(&self, signal_name: &str) -> Option<f32> {
@@ -105,6 +155,7 @@ impl MessageData {
     fn construct_frame(&self, can_id: u32) -> Result<CanFrame, String> {
         let mut frame_data = [0u8; 8];
 
+        // Encode all signals into the frame data
         for signal in &self.signals {
             let signal_value = self
                 .signal_values
@@ -115,15 +166,11 @@ impl MessageData {
             let raw_value =
                 ((*signal_value - *signal.offset() as f32) / *signal.factor() as f32) as u64;
 
-            // Create bit mask for the signal
-            let bit_mask: u64 = (1u64 << *signal.signal_size()) - 1;
-            let masked_value = raw_value & bit_mask;
-
-            // Encode the signal into the frame data
-            self.encode_signal_to_frame(&mut frame_data, signal, masked_value);
+            // Encode this signal into the frame data
+            self.encode_signal_to_frame(&mut frame_data, signal, raw_value);
         }
 
-        // Create the CAN frame
+        // Create the CAN frame with the encoded data
         let id = if can_id > 0x7FF || (can_id & EFF_FLAG != 0) {
             // Extended CAN ID (29-bit) - remove EFF_FLAG if present
             let extended_id =
@@ -209,6 +256,11 @@ async fn main() -> Result<()> {
     // Load environment variables from .env file
     dotenv().ok();
 
+    tokio::spawn(async {
+        // Setup MQTT client
+        mqtt_integration::MqttIntegration::setup_mqtt_client().await;
+    });
+
     // Read configuration from environment variables with fallback defaults
     let dbc_file = env::var("DBC_FILE").unwrap_or_else(|_| "epc.dbc".to_string());
     let can_interface = env::var("CAN_INTERFACE").unwrap_or_else(|_| "can0".to_string());
@@ -216,13 +268,21 @@ async fn main() -> Result<()> {
     println!("Using DBC file: {}", dbc_file);
     println!("Using CAN interface: {}", can_interface);
 
+    // Initialize Redis connection
+    if let Err(e) = init_redis().await {
+        eprintln!(
+            "Warning: Failed to initialize Redis: {}. Continuing without Redis.",
+            e
+        );
+    }
+
     let mut socket_rx = CanSocket::open(&can_interface).unwrap();
 
-    // Take the receiver from the global channel
-    let mut can_tx_receiver = {
-        let mut receiver_lock = CAN_TX_CHANNEL.1.write().await;
-        receiver_lock.take().expect("CAN TX receiver already taken")
-    };
+    // Create CAN transmission channel
+    let (can_tx_sender, mut can_tx_receiver) = mpsc::unbounded_channel::<CanFrame>();
+    CAN_TX_SENDER
+        .set(can_tx_sender)
+        .map_err(|_| anyhow::anyhow!("Failed to initialize CAN TX sender - already initialized"))?;
 
     // Read DBC file and create message data storage
     let mut f = File::open(&dbc_file).await?;
@@ -247,9 +307,6 @@ async fn main() -> Result<()> {
         *GLOBAL_MESSAGE_DATA.write().await = message_data;
     }
 
-    // Create a timer for periodic printing
-    let mut print_timer = interval(Duration::from_secs(10));
-
     loop {
         tokio::select! {
             // Handle incoming CAN frames
@@ -264,7 +321,14 @@ async fn main() -> Result<()> {
 
                         // Update message data if we have it
                         if let Some(msg_data) = GLOBAL_MESSAGE_DATA.write().await.get_mut(&id) {
-                            msg_data.update_from_frame(&frame);
+                            let changed_signals = msg_data.update_from_frame(&frame);
+
+                            // Store only changed signal values in Redis hash
+                            for (signal_name, value) in changed_signals {
+                                if let Err(e) = store_signal_in_redis(&msg_data.name, &signal_name, value).await {
+                                    eprintln!("Failed to store signal {}_{} in Redis: {}", msg_data.name, signal_name, e);
+                                }
+                            }
                         }
                     }
                     Some(Err(err)) => {
@@ -289,49 +353,6 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = print_timer.tick() => {
-                println!("\n========== CAN Signal Values ==========");
-                {
-                    let message_data = GLOBAL_MESSAGE_DATA.read().await;
-                    for (can_id, msg_data) in message_data.iter() {
-                        println!("\nCAN ID: 0x{:08x}", can_id);
-                        msg_data.print_all_signals();
-                    }
-                }
-                println!("=======================================\n");
-
-                // Demonstrate frame construction by modifying PhaseSequence
-                match construct_frame_with_signal(
-                    "StatusGridMonitorLoc",
-                    "PhaseSequence",
-                    1.0  // Set PhaseSequence to 1.0
-                ).await {
-                    Ok((can_id, frame)) => {
-                        println!("Constructed frame for PhaseSequence modification:");
-                        println!("CAN ID: 0x{:08x}", can_id);
-                        match frame.id() {
-                            socketcan::Id::Standard(id) => {
-                                println!("Frame ID (Standard): 0x{:03x}", id.as_raw());
-                            }
-                            socketcan::Id::Extended(id) => {
-                                println!("Frame ID (Extended): 0x{:08x}", id.as_raw());
-                            }
-                        }
-                        println!("Frame data: {:02x?}", frame.data());
-
-                        // Send the frame
-                        if let Err(e) = write_frame(frame) {
-                            println!("Failed to send frame: {}", e);
-                        } else {
-                            println!("Frame sent successfully");
-                        }
-                        println!("-------------------------------------------\n");
-                    }
-                    Err(e) => {
-                        println!("Failed to construct frame for PhaseSequence: {}\n", e);
-                    }
-                }
-            }
         }
     }
 
@@ -339,7 +360,7 @@ async fn main() -> Result<()> {
 }
 
 // Helper function to find a message by name and construct a frame with modified signal value
-async fn construct_frame_with_signal(
+pub async fn construct_frame_with_signal(
     message_name: &str,
     signal_name: &str,
     new_value: f32,
@@ -355,6 +376,11 @@ async fn construct_frame_with_signal(
     // Set the new signal value
     msg_data.set_signal_value(signal_name, new_value)?;
 
+    // Store the signal update in Redis hash
+    if let Err(e) = store_signal_in_redis(&msg_data.name, signal_name, new_value).await {
+        eprintln!("Failed to store signal in Redis: {}", e);
+    }
+
     // Construct the frame
     let frame = msg_data.construct_frame(*can_id)?;
 
@@ -363,10 +389,36 @@ async fn construct_frame_with_signal(
 
 /// Write a CAN frame to the socket
 pub fn write_frame(frame: CanFrame) -> Result<(), String> {
-    CAN_TX_CHANNEL
-        .0
+    let sender = CAN_TX_SENDER
+        .get()
+        .ok_or_else(|| "CAN TX sender not initialized".to_string())?;
+    sender
         .send(frame)
         .map_err(|e| format!("Failed to send CAN frame: {}", e))
+}
+
+// Get all signals from Redis hash epc_canbus
+async fn get_all_signals_from_redis() -> Result<HashMap<String, f32>> {
+    let mut conn = get_redis_connection().await?;
+    let hash_key = "epc_canbus";
+
+    let result: HashMap<String, f32> = redis::cmd("HGETALL").arg(hash_key).query(&mut conn)?;
+
+    Ok(result)
+}
+
+// Get specific signal value from Redis hash
+async fn get_signal_from_redis(message_name: &str, signal_name: &str) -> Result<Option<f32>> {
+    let mut conn = get_redis_connection().await?;
+    let hash_key = "epc_canbus";
+    let field_key = format!("{}_{}", message_name, signal_name);
+
+    let result: Option<f32> = redis::cmd("HGET")
+        .arg(hash_key)
+        .arg(&field_key)
+        .query(&mut conn)?;
+
+    Ok(result)
 }
 
 #[cfg(test)]
