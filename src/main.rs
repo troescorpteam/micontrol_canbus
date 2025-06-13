@@ -2,20 +2,29 @@ use anyhow::Result;
 use can_dbc::{ByteOrder, Signal};
 use dotenv::dotenv;
 use futures::StreamExt;
+use lazy_static::lazy_static;
 use socketcan::{CanFrame, EmbeddedFrame, ExtendedId, Id, StandardId, tokio::CanSocket};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
 // Standard CAN constants (missing from socketcan crate)
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 
+// Global message data storage using lazy_static
+lazy_static! {
+    pub static ref GLOBAL_MESSAGE_DATA: Arc<RwLock<HashMap<u32, MessageData>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+}
+
 // Structure to store message signals and their current values
 #[derive(Debug, Clone)]
-struct MessageData {
+pub struct MessageData {
     name: String,
     signals: Vec<Signal>,
     signal_values: HashMap<String, f32>,
@@ -204,20 +213,21 @@ async fn main() -> Result<()> {
     f.read_to_end(&mut buffer).await?;
     let dbc = can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC");
 
-    // HashMap to store all message data by CAN ID
-    let mut message_data: HashMap<u32, MessageData> = HashMap::new();
-
-    // Initialize message data from DBC
-    for msg in dbc.messages() {
-        let message_id: u32 = match msg.message_id() {
-            can_dbc::MessageId::Standard(id) => (*id).into(),
-            can_dbc::MessageId::Extended(id) => *id,
-        };
-        let id = message_id & !EFF_FLAG;
-        message_data.insert(
-            id,
-            MessageData::new(msg.message_name().clone(), msg.signals().clone()),
-        );
+    // Initialize global message data from DBC
+    {
+        let mut message_data = HashMap::new();
+        for msg in dbc.messages() {
+            let message_id: u32 = match msg.message_id() {
+                can_dbc::MessageId::Standard(id) => (*id).into(),
+                can_dbc::MessageId::Extended(id) => *id,
+            };
+            let id = message_id & !EFF_FLAG;
+            message_data.insert(
+                id,
+                MessageData::new(msg.message_name().clone(), msg.signals().clone()),
+            );
+        }
+        *GLOBAL_MESSAGE_DATA.write().await = message_data;
     }
 
     // Create a timer for periodic printing
@@ -235,7 +245,7 @@ async fn main() -> Result<()> {
                         let id = raw_id & !EFF_FLAG;
 
                         // Update message data if we have it
-                        if let Some(msg_data) = message_data.get_mut(&id) {
+                        if let Some(msg_data) = GLOBAL_MESSAGE_DATA.write().await.get_mut(&id) {
                             msg_data.update_from_frame(&frame);
                         }
                     }
@@ -247,15 +257,18 @@ async fn main() -> Result<()> {
             }
             _ = print_timer.tick() => {
                 println!("\n========== CAN Signal Values ==========");
-                for (can_id, msg_data) in &message_data {
-                    println!("\nCAN ID: 0x{:08x}", can_id);
-                    msg_data.print_all_signals();
+                {
+                    let message_data = GLOBAL_MESSAGE_DATA.read().await;
+                    for (can_id, msg_data) in message_data.iter() {
+                        println!("\nCAN ID: 0x{:08x}", can_id);
+                        msg_data.print_all_signals();
+                    }
                 }
                 println!("=======================================\n");
 
                 // Demonstrate frame construction by modifying PhaseSequence
                 if let Ok((can_id, frame)) = construct_frame_with_signal(
-                    &mut message_data,
+                    &mut *GLOBAL_MESSAGE_DATA.write().await,
                     "StatusGridMonitorLoc",
                     "PhaseSequence",
                     1.0  // Set PhaseSequence to 1.0
@@ -271,6 +284,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     println!("Frame data: {:02x?}", frame.data());
+                    // socket_rx.write_frame(frame).await?;
                     println!("-------------------------------------------\n");
                 } else {
                     println!("Failed to construct frame for PhaseSequence\n");
