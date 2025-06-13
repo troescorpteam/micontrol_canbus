@@ -1,9 +1,11 @@
 use anyhow::Result;
 use can_dbc::{ByteOrder, Signal};
+use dotenv::dotenv;
 use futures::StreamExt;
 use socketcan::{CanFrame, EmbeddedFrame, ExtendedId, Id, StandardId, tokio::CanSocket};
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::env;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, interval};
@@ -102,11 +104,13 @@ impl MessageData {
         }
 
         // Create the CAN frame
-        let id = if can_id & EFF_FLAG != 0 {
+        let id = if can_id > 0x7FF || (can_id & EFF_FLAG != 0) {
+            // Extended CAN ID (29-bit) - remove EFF_FLAG if present
             let extended_id =
                 ExtendedId::new(can_id & !EFF_FLAG).ok_or("Invalid extended CAN ID")?;
             Id::Extended(extended_id)
         } else {
+            // Standard CAN ID (11-bit)
             let standard_id = StandardId::new(can_id as u16).ok_or("Invalid standard CAN ID")?;
             Id::Standard(standard_id)
         };
@@ -130,7 +134,13 @@ impl MessageData {
                     let bit_offset = bit_position % 8;
                     let bits_in_byte = std::cmp::min(remaining_bits, 8 - bit_offset);
 
-                    let byte_mask = ((1u8 << bits_in_byte) - 1) << bit_offset;
+                    // Fix overflow issue by using u16 for intermediate calculations
+                    let byte_mask = if bits_in_byte == 8 {
+                        0xFFu8
+                    } else {
+                        ((1u16 << bits_in_byte) - 1) as u8
+                    } << bit_offset;
+
                     let byte_value = ((current_value as u8) << bit_offset) & byte_mask;
 
                     frame_data[byte_index] &= !byte_mask;
@@ -152,7 +162,13 @@ impl MessageData {
                     let bit_offset = bit_position % 8;
                     let bits_in_byte = std::cmp::min(remaining_bits, 8 - bit_offset);
 
-                    let byte_mask = ((1u8 << bits_in_byte) - 1) << (8 - bit_offset - bits_in_byte);
+                    // Fix overflow issue by using u16 for intermediate calculations
+                    let byte_mask = if bits_in_byte == 8 {
+                        0xFFu8
+                    } else {
+                        ((1u16 << bits_in_byte) - 1) as u8
+                    } << (8 - bit_offset - bits_in_byte);
+
                     let byte_value =
                         ((current_value as u8) << (8 - bit_offset - bits_in_byte)) & byte_mask;
 
@@ -170,14 +186,20 @@ impl MessageData {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Use default values: epc.dbc file and can0 interface
-    let dbc_file = "epc.dbc";
-    let can_interface = "can0";
+    // Load environment variables from .env file
+    dotenv().ok();
 
-    let mut socket_rx = CanSocket::open(can_interface).unwrap();
+    // Read configuration from environment variables with fallback defaults
+    let dbc_file = env::var("DBC_FILE").unwrap_or_else(|_| "epc.dbc".to_string());
+    let can_interface = env::var("CAN_INTERFACE").unwrap_or_else(|_| "can0".to_string());
+
+    println!("Using DBC file: {}", dbc_file);
+    println!("Using CAN interface: {}", can_interface);
+
+    let mut socket_rx = CanSocket::open(&can_interface).unwrap();
 
     // Read DBC file and create message data storage
-    let mut f = File::open(dbc_file).await?;
+    let mut f = File::open(&dbc_file).await?;
     let mut buffer = Vec::new();
     f.read_to_end(&mut buffer).await?;
     let dbc = can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC");
@@ -298,4 +320,275 @@ fn construct_frame_with_signal_by_id(
 
     // Construct the frame
     msg_data.construct_frame(can_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn load_test_dbc() -> Result<can_dbc::DBC> {
+        let mut f = File::open("epc.dbc").await?;
+        let mut buffer = Vec::new();
+        f.read_to_end(&mut buffer).await?;
+        Ok(can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC"))
+    }
+
+    #[tokio::test]
+    async fn test_phase_sequence_frame_construction() {
+        // Load the actual DBC file to get real message structures
+        let dbc = load_test_dbc().await.unwrap();
+
+        // Find StatusGridMonitorLoc message
+        let status_grid_msg = dbc
+            .messages()
+            .iter()
+            .find(|msg| msg.message_name() == "StatusGridMonitorLoc")
+            .expect("StatusGridMonitorLoc message not found in DBC");
+
+        let message_id: u32 = match status_grid_msg.message_id() {
+            can_dbc::MessageId::Standard(id) => (*id).into(),
+            can_dbc::MessageId::Extended(id) => *id,
+        };
+        let can_id = message_id & !EFF_FLAG;
+
+        // Create MessageData with real signals from DBC
+        let mut msg_data = MessageData::new(
+            status_grid_msg.message_name().clone(),
+            status_grid_msg.signals().clone(),
+        );
+
+        // Check if PhaseSequence signal exists
+        let phase_sequence_signal = status_grid_msg
+            .signals()
+            .iter()
+            .find(|signal| signal.name() == "PhaseSequence");
+
+        assert!(
+            phase_sequence_signal.is_some(),
+            "PhaseSequence signal not found in StatusGridMonitorLoc"
+        );
+
+        // Set PhaseSequence to 1.0
+        let result = msg_data.set_signal_value("PhaseSequence", 1.0);
+        assert!(
+            result.is_ok(),
+            "Failed to set PhaseSequence value: {:?}",
+            result
+        );
+
+        // Try to construct the frame
+        let frame_result = msg_data.construct_frame(can_id);
+        assert!(
+            frame_result.is_ok(),
+            "Failed to construct frame: {:?}",
+            frame_result
+        );
+
+        let frame = frame_result.unwrap();
+        println!(
+            "Successfully constructed frame with CAN ID: 0x{:08x}",
+            can_id
+        );
+        println!("Frame data: {:02x?}", frame.data());
+
+        // Verify the frame has the expected properties
+        assert_eq!(frame.data().len(), 8, "Frame should have 8 bytes of data");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_signal_frame_construction() {
+        let dbc = load_test_dbc().await.unwrap();
+
+        // Test with different messages to ensure the frame construction works generally
+        let test_messages = [
+            "StatusGridMonitorLoc",
+            "StatusInverterPhaseArm",
+            "StatusInverterAcuate",
+        ];
+
+        for msg_name in &test_messages {
+            if let Some(msg) = dbc.messages().iter().find(|m| m.message_name() == msg_name) {
+                let message_id: u32 = match msg.message_id() {
+                    can_dbc::MessageId::Standard(id) => (*id).into(),
+                    can_dbc::MessageId::Extended(id) => *id,
+                };
+                let can_id = message_id & !EFF_FLAG;
+
+                let mut msg_data =
+                    MessageData::new(msg.message_name().clone(), msg.signals().clone());
+
+                // Set first signal to a test value if it exists
+                if let Some(first_signal) = msg.signals().first() {
+                    let result = msg_data.set_signal_value(first_signal.name(), 42.0);
+                    assert!(
+                        result.is_ok(),
+                        "Failed to set signal value for {}",
+                        first_signal.name()
+                    );
+
+                    let frame_result = msg_data.construct_frame(can_id);
+                    assert!(
+                        frame_result.is_ok(),
+                        "Failed to construct frame for message {}: {:?}",
+                        msg_name,
+                        frame_result
+                    );
+
+                    println!("Successfully constructed frame for message: {}", msg_name);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signal_encoding_decoding_roundtrip() {
+        let dbc = load_test_dbc().await.unwrap();
+
+        if let Some(msg) = dbc
+            .messages()
+            .iter()
+            .find(|m| m.message_name() == "StatusGridMonitorLoc")
+        {
+            let message_id: u32 = match msg.message_id() {
+                can_dbc::MessageId::Standard(id) => (*id).into(),
+                can_dbc::MessageId::Extended(id) => *id,
+            };
+            let can_id = message_id & !EFF_FLAG;
+
+            let mut msg_data = MessageData::new(msg.message_name().clone(), msg.signals().clone());
+
+            // Set all signals to known test values
+            let test_values = vec![
+                ("PhaseSequence", 1.0),
+                ("NetworkVoltage", 230.5),
+                ("NetworkFrequency", 50.2),
+            ];
+
+            for (signal_name, value) in &test_values {
+                if msg_data.signal_values.contains_key(*signal_name) {
+                    msg_data.set_signal_value(signal_name, *value).unwrap();
+                }
+            }
+
+            // Construct frame
+            let frame = msg_data.construct_frame(can_id).unwrap();
+
+            // Create a new MessageData and decode the frame
+            let mut decoded_msg_data =
+                MessageData::new(msg.message_name().clone(), msg.signals().clone());
+            decoded_msg_data.update_from_frame(&frame);
+
+            // Check that we can retrieve the values (allowing for some precision loss)
+            for (signal_name, expected_value) in &test_values {
+                if let Some(decoded_value) = decoded_msg_data.get_signal_value(signal_name) {
+                    let diff = (decoded_value - expected_value).abs();
+                    assert!(
+                        diff < 0.1,
+                        "Signal {} roundtrip failed: expected {}, got {}",
+                        signal_name,
+                        expected_value,
+                        decoded_value
+                    );
+                    println!(
+                        "Signal {} roundtrip successful: {} -> {}",
+                        signal_name, expected_value, decoded_value
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_frame_construction_helper_functions() {
+        // Test the helper functions without requiring a real CAN interface
+        let mut message_data: HashMap<u32, MessageData> = HashMap::new();
+
+        // This test verifies the logic of the helper functions even if we can't test actual frame construction
+        // due to missing DBC or CAN interface in test environment
+
+        // We can test that the functions handle missing messages correctly
+        let result =
+            construct_frame_with_signal_by_id(&mut message_data, 0x12345678, "TestSignal", 1.0);
+        assert!(result.is_err(), "Should fail when message doesn't exist");
+
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("not found"),
+            "Error should mention message not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_debug_phase_sequence_issue() {
+        // This test specifically debugs the PhaseSequence issue
+        let dbc = load_test_dbc().await.unwrap();
+
+        // Print all messages to understand the structure
+        println!("Available messages in DBC:");
+        for msg in dbc.messages() {
+            println!("  {}: ID {:?}", msg.message_name(), msg.message_id());
+        }
+
+        // Find and analyze StatusGridMonitorLoc
+        if let Some(msg) = dbc
+            .messages()
+            .iter()
+            .find(|m| m.message_name() == "StatusGridMonitorLoc")
+        {
+            println!("\nStatusGridMonitorLoc signals:");
+            for signal in msg.signals() {
+                println!(
+                    "  {}: start_bit={}, size={}, byte_order={:?}, factor={}, offset={}",
+                    signal.name(),
+                    signal.start_bit(),
+                    signal.signal_size(),
+                    signal.byte_order(),
+                    signal.factor(),
+                    signal.offset()
+                );
+            }
+
+            let message_id: u32 = match msg.message_id() {
+                can_dbc::MessageId::Standard(id) => (*id).into(),
+                can_dbc::MessageId::Extended(id) => *id,
+            };
+            let can_id = message_id & !EFF_FLAG;
+            println!("\nCAN ID: 0x{:08x} (raw: 0x{:08x})", can_id, message_id);
+
+            // Try the frame construction that's failing in main
+            let mut message_data: HashMap<u32, MessageData> = HashMap::new();
+            message_data.insert(
+                can_id,
+                MessageData::new(msg.message_name().clone(), msg.signals().clone()),
+            );
+
+            let result = construct_frame_with_signal(
+                &mut message_data,
+                "StatusGridMonitorLoc",
+                "PhaseSequence",
+                1.0,
+            );
+
+            match result {
+                Ok((returned_can_id, frame)) => {
+                    println!("SUCCESS: Constructed frame!");
+                    println!("  Returned CAN ID: 0x{:08x}", returned_can_id);
+                    println!("  Frame data: {:02x?}", frame.data());
+                }
+                Err(e) => {
+                    println!("ERROR: {}", e);
+
+                    // Debug further - check if the signal exists
+                    if let Some(msg_data) = message_data.get(&can_id) {
+                        println!("Signal values in message:");
+                        for (name, value) in &msg_data.signal_values {
+                            println!("  {}: {}", name, value);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("StatusGridMonitorLoc message not found!");
+        }
+    }
 }
