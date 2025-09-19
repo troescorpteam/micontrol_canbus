@@ -1,0 +1,7 @@
+[[hardware_mappings]]
+hardware_configurations = ["epc"]
+controller = "can0"
+protocol = "CANBUS"
+hardware_type = "bams"
+hardware_id = "1"
+auto_invalidation_interval = 30

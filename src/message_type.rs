@@ -1,7 +1,6 @@
 use bitvec::prelude::{Lsb0, Msb0};
 use bitvec::view::BitView;
 use can_dbc::{ByteOrder, MultiplexIndicator, Signal, ValueType};
-use lazy_static::lazy_static;
 use serde::Deserialize;
 use serde::Serialize;
 use socketcan::CanFrame;
@@ -10,10 +9,7 @@ use socketcan::ExtendedId;
 use socketcan::Id;
 use socketcan::StandardId;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::info;
 
 // Standard CAN constants (missing from socketcan crate)
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
@@ -192,16 +188,6 @@ impl MessageData {
             mux_values.values().any(|current| *current == expected)
         }
     }
-}
-
-// Global CAN transmission channel
-pub static CAN_TX_SENDER: tokio::sync::OnceCell<mpsc::UnboundedSender<CanFrame>> =
-    tokio::sync::OnceCell::const_new();
-
-// Global message data storage using lazy_static
-lazy_static! {
-    pub static ref GLOBAL_MESSAGE_DATA: Arc<RwLock<HashMap<u32, MessageData>>> =
-        Arc::new(RwLock::new(HashMap::new()));
 }
 
 fn decode_signal(signal: &Signal, data: &[u8]) -> Option<f64> {

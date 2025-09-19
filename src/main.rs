@@ -1,145 +1,84 @@
-use crate::message_type::MessageData;
-use crate::message_type::{CAN_TX_SENDER, GLOBAL_MESSAGE_DATA};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bus::{BusManager, BusState, RedisCommand};
+use can_dbc::DBC;
+use chrono::{DateTime, SecondsFormat, Utc};
 use dotenv::dotenv;
-use futures::StreamExt;
+use futures::{StreamExt, future};
+use message_type::MessageData;
 use redis::aio::ConnectionManager;
 use serde::Deserialize;
-use socketcan::{CanFrame, EmbeddedFrame, tokio::CanSocket};
+use serde_json::json;
+use socketcan::{CanFrame, EmbeddedFrame, Id, tokio::CanSocket};
 use std::collections::HashMap;
 use std::env;
-use std::io::ErrorKind;
-use tokio::fs::{self, File};
-use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod bus;
 mod message_type;
 mod mqtt_integration;
 
-// Standard CAN constants (missing from socketcan crate)
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
-const REDIS_HASH_KEY: &str = "epc_canbus";
-
-// Global Redis connection manager and worker channel
-static REDIS_MANAGER: tokio::sync::OnceCell<ConnectionManager> = tokio::sync::OnceCell::const_new();
-static REDIS_COMMAND_SENDER: tokio::sync::OnceCell<mpsc::UnboundedSender<RedisCommand>> =
-    tokio::sync::OnceCell::const_new();
-
-#[derive(Debug)]
-struct RedisCommand {
-    field_key: String,
-    value: f64,
-}
+const CONNECTIONS_HASH: &str = "connections";
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfig {
     #[serde(default)]
-    buses: Vec<BusConfig>,
+    hardware_mappings: Vec<HardwareMapping>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct BusConfig {
-    interface: String,
-    dbc: String,
+struct HardwareMapping {
+    #[serde(default)]
+    hardware_configurations: Vec<String>,
+    controller: String,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    hardware_type: Option<String>,
+    #[serde(default)]
+    hardware_id: Option<String>,
+    #[serde(default)]
+    auto_invalidation_interval: Option<u64>,
 }
 
 impl AppConfig {
-    fn dbc_for(&self, interface: &str) -> Option<&str> {
-        self.buses
+    fn all_mappings(&self) -> Vec<&HardwareMapping> {
+        self.hardware_mappings.iter().collect()
+    }
+}
+
+impl HardwareMapping {
+    fn matches_interface(&self, interface: &str) -> bool {
+        self.controller == interface
+    }
+
+    fn dbc(&self) -> Option<String> {
+        if let Some(entry) = self
+            .hardware_configurations
             .iter()
-            .find(|bus| bus.interface == interface)
-            .map(|bus| bus.dbc.as_str())
-    }
+            .find(|cfg| cfg.ends_with(".dbc"))
+        {
+            return Some(entry.clone());
+        }
 
-    fn default_bus(&self) -> Option<&BusConfig> {
-        self.buses.first()
-    }
-}
-
-// Initialize Redis client
-async fn init_redis() -> Result<()> {
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let client = redis::Client::open(redis_url)?;
-    let manager = ConnectionManager::new(client).await?;
-
-    // Test connection asynchronously
-    let mut ping_conn = manager.clone();
-    let _: String = redis::cmd("PING").query_async(&mut ping_conn).await?;
-
-    // Spawn worker task for Redis writes
-    let (sender, mut receiver) = mpsc::unbounded_channel::<RedisCommand>();
-    tokio::spawn({
-        let mut worker_manager = manager.clone();
-        async move {
-            while let Some(command) = receiver.recv().await {
-                let mut conn = worker_manager.clone();
-                if let Err(err) = redis::cmd("HSET")
-                    .arg(REDIS_HASH_KEY)
-                    .arg(&command.field_key)
-                    .arg(command.value)
-                    .query_async::<()>(&mut conn)
-                    .await
-                {
-                    error!(
-                        signal = %command.field_key,
-                        error = %err,
-                        "Failed to store signal in Redis"
-                    );
-                }
+        self.hardware_configurations.iter().find_map(|cfg| {
+            let candidate = format!("{}.dbc", cfg);
+            if Path::new(&candidate).exists() {
+                Some(candidate)
+            } else {
+                None
             }
-        }
-    });
-
-    REDIS_MANAGER
-        .set(manager)
-        .map_err(|_| anyhow::anyhow!("Failed to initialize Redis manager - already initialized"))?;
-    REDIS_COMMAND_SENDER.set(sender).map_err(|_| {
-        anyhow::anyhow!("Failed to initialize Redis command sender - already initialized")
-    })?;
-
-    info!("Redis connection initialized successfully");
-    Ok(())
-}
-
-async fn load_config(path: &str) -> Result<AppConfig> {
-    match fs::read_to_string(path).await {
-        Ok(contents) => {
-            let config = toml::from_str::<AppConfig>(&contents)?;
-            Ok(config)
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(AppConfig::default()),
-        Err(err) => Err(err.into()),
+        })
     }
-}
-
-// Get Redis connection manager clone
-async fn get_redis_connection() -> Result<ConnectionManager> {
-    let manager = REDIS_MANAGER
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Redis client not initialized"))?;
-    Ok(manager.clone())
-}
-
-// Store signal value in Redis hash epc_canbus with key as messagename_signalname
-async fn store_signal_in_redis(message_name: &str, signal_name: &str, value: f32) -> Result<()> {
-    if let Some(sender) = REDIS_COMMAND_SENDER.get() {
-        let field_key = format!("{}_{}", message_name, signal_name);
-        sender
-            .send(RedisCommand {
-                field_key,
-                value: value as f64,
-            })
-            .map_err(|err| anyhow::anyhow!("Failed to queue Redis command: {}", err))?;
-    }
-
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -148,478 +87,343 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load environment variables from .env file
     dotenv().ok();
 
-    // Set up signal update channel for MQTT integration FIRST
+    let config = load_config("config.toml").await?;
+    if config.hardware_mappings.is_empty() {
+        anyhow::bail!("No hardware_mappings defined in config.toml");
+    }
 
-    tokio::spawn(async {
-        info!("Starting MQTT client setup...");
+    let mappings_to_run = config.all_mappings();
 
-        // Setup MQTT client
-        mqtt_integration::MqttIntegration::setup_mqtt_client().await;
-    });
-
-    // Load optional configuration mapping CAN ports to DBC files
-    let config = match load_config("config.toml").await {
-        Ok(cfg) => cfg,
+    let redis_manager = match init_redis_connection().await {
+        Ok(manager) => {
+            info!("Redis connection initialized successfully");
+            Some(manager)
+        }
         Err(err) => {
-            warn!(error = %err, "Failed to load config.toml; falling back to defaults");
-            AppConfig::default()
+            warn!(
+                error = %err,
+                "Failed to initialize Redis. Continuing without Redis."
+            );
+            None
         }
     };
 
-    // Resolve CAN interface and DBC file based on environment overrides and configuration
-    let mut can_interface = env::var("CAN_INTERFACE").ok();
-    let mut dbc_file = env::var("DBC_FILE").ok();
+    let bus_manager = Arc::new(BusManager::new());
 
-    if let Some(ref interface) = can_interface {
-        if dbc_file.is_none() {
-            if let Some(cfg_dbc) = config.dbc_for(interface) {
-                dbc_file = Some(cfg_dbc.to_owned());
-            }
+    for mapping in mappings_to_run {
+        let interface = mapping.controller.clone();
+        let dbc_path = mapping.dbc().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No DBC file specified for controller '{}' in config.toml",
+                mapping.controller
+            )
+        })?;
+
+        info!(
+            interface = %interface,
+            dbc = %dbc_path,
+            "Initializing CAN bus runtime"
+        );
+
+        let dbc = load_dbc(&dbc_path).await?;
+        let (message_store, message_index) = build_message_store(&dbc);
+
+        let message_data = Arc::new(RwLock::new(message_store));
+        let message_index = Arc::new(message_index);
+
+        let (redis_hash, mqtt_topic) = derive_identifiers(mapping, &interface);
+
+        let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<CanFrame>();
+        let (redis_sender, redis_rx) = if redis_manager.is_some() {
+            let (tx, rx) = mpsc::unbounded_channel::<RedisCommand>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let bus_id = interface.clone();
+        let bus_state = Arc::new(BusState::new(
+            bus_id.clone(),
+            mapping.controller.clone(),
+            interface.clone(),
+            redis_hash.clone(),
+            mqtt_topic.clone(),
+            mapping.hardware_type.clone(),
+            mapping.hardware_id.clone(),
+            Arc::clone(&message_data),
+            Arc::clone(&message_index),
+            tx_sender.clone(),
+            redis_sender.clone(),
+        ));
+
+        bus_manager.insert(Arc::clone(&bus_state)).await;
+
+        if let (Some(manager), Some(rx)) = (redis_manager.clone(), redis_rx) {
+            spawn_redis_worker(manager, rx, redis_hash.clone());
         }
-    } else if let Some(default_bus) = config.default_bus() {
-        can_interface = Some(default_bus.interface.clone());
-        if dbc_file.is_none() {
-            dbc_file = Some(default_bus.dbc.clone());
-        }
-    }
 
-    let can_interface = can_interface.unwrap_or_else(|| "can0".to_string());
-    let dbc_file = dbc_file.unwrap_or_else(|| "epc.dbc".to_string());
-
-    info!(dbc_file = %dbc_file, "Using DBC file");
-    info!(can_interface = %can_interface, "Using CAN interface");
-
-    // Initialize Redis connection
-    if let Err(e) = init_redis().await {
-        warn!(
-            error = %e,
-            "Failed to initialize Redis. Continuing without Redis."
+        spawn_can_runtime(
+            bus_state,
+            message_data,
+            tx_receiver,
+            interface,
+            redis_manager.clone(),
         );
     }
 
-    let mut socket_rx = CanSocket::open(&can_interface).unwrap();
+    let mqtt_bus_manager = Arc::clone(&bus_manager);
+    tokio::spawn(async move {
+        mqtt_integration::MqttIntegration::setup_mqtt_client(mqtt_bus_manager).await;
+    });
 
-    // Create CAN transmission channel
-    let (can_tx_sender, mut can_tx_receiver) = mpsc::unbounded_channel::<CanFrame>();
-    CAN_TX_SENDER
-        .set(can_tx_sender)
-        .map_err(|_| anyhow::anyhow!("Failed to initialize CAN TX sender - already initialized"))?;
+    info!("Runtime initialized for all configured CAN buses");
+    future::pending::<()>().await;
+    Ok(())
+}
 
-    // Read DBC file and create message data storage
-    let mut f = File::open(&dbc_file).await?;
-    let mut buffer = Vec::new();
-    f.read_to_end(&mut buffer).await?;
-    let dbc = can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC");
+async fn load_config(path: &str) -> Result<AppConfig> {
+    let contents = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read configuration file '{path}'"))?;
 
-    // Initialize global message data from DBC
-    {
-        let mut message_data = HashMap::new();
-        for msg in dbc.messages() {
-            let message_id: u32 = match msg.message_id() {
-                can_dbc::MessageId::Standard(id) => (*id).into(),
-                can_dbc::MessageId::Extended(id) => *id,
-            };
-            let id = message_id & !EFF_FLAG;
-            let dlc = *msg.message_size() as u8;
-            let is_extended = matches!(msg.message_id(), can_dbc::MessageId::Extended(_));
-            message_data.insert(
-                id,
-                MessageData::new(
-                    msg.message_name().clone(),
-                    msg.signals().clone(),
-                    dlc,
-                    is_extended,
-                ),
-            );
-        }
-        *GLOBAL_MESSAGE_DATA.write().await = message_data;
+    let config = toml::from_str::<AppConfig>(&contents)
+        .with_context(|| format!("failed to parse configuration file '{path}'"))?;
+
+    Ok(config)
+}
+
+async fn init_redis_connection() -> Result<ConnectionManager> {
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let client = redis::Client::open(redis_url)?;
+    let manager = ConnectionManager::new(client).await?;
+
+    let mut ping_conn = manager.clone();
+    let _: String = redis::cmd("PING").query_async(&mut ping_conn).await?;
+
+    Ok(manager)
+}
+
+async fn load_dbc(path: &str) -> Result<DBC> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("Failed to read DBC file '{path}'"))?;
+    DBC::from_slice(&bytes)
+        .map_err(|err| anyhow::anyhow!("Failed to parse DBC file '{path}': {:?}", err))
+}
+
+fn build_message_store(dbc: &DBC) -> (HashMap<u32, MessageData>, HashMap<String, u32>) {
+    let mut message_map = HashMap::new();
+    let mut name_index = HashMap::new();
+
+    for msg in dbc.messages() {
+        let message_id: u32 = match msg.message_id() {
+            can_dbc::MessageId::Standard(id) => (*id).into(),
+            can_dbc::MessageId::Extended(id) => *id,
+        };
+        let id = message_id & !EFF_FLAG;
+        name_index.insert(msg.message_name().clone(), id);
+        message_map.insert(
+            id,
+            MessageData::new(
+                msg.message_name().clone(),
+                msg.signals().clone(),
+                *msg.message_size() as u8,
+                matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
+            ),
+        );
     }
 
-    loop {
-        tokio::select! {
-            socket_result = socket_rx.next() => {
-                match socket_result {
-                    Some(Ok(frame)) => {
-                        let raw_id = match frame.id() {
-                            socketcan::Id::Standard(id) => id.as_raw() as u32,
-                            socketcan::Id::Extended(id) => id.as_raw(),
-                        };
-                        let id = raw_id & !EFF_FLAG;
+    (message_map, name_index)
+}
 
-                        // Update message data if we have it
-                        if let Some(msg_data) = GLOBAL_MESSAGE_DATA.write().await.get_mut(&id) {
-                            let changed_signals = msg_data.update_from_frame(&frame);
-
-                            // Store only changed signal values in Redis hash
-                            for (signal_name, value) in changed_signals {
-                                if let Err(e) = store_signal_in_redis(&msg_data.name, &signal_name, value).await {
-                                    error!(
-                                        message_name = %msg_data.name,
-                                        signal_name = %signal_name,
-                                        error = %e,
-                                        "Failed to store signal in Redis"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(err)) => {
-                        error!(error = %err, "IO error reading CAN frame");
-                    }
-                    None => break,
-                }
-            }
-            // Handle outgoing CAN frames from the channel
-            frame_to_send = can_tx_receiver.recv() => {
-                match frame_to_send {
-                    Some(frame) => {
-                        if let Err(e) = socket_rx.write_frame(frame).await {
-                            error!(error = %e, "Failed to send CAN frame");
-                        } else {
-                            debug!(frame_data = ?frame.data(), "Sent CAN frame");
-                        }
-                    }
-                    None => {
-                        warn!("CAN TX channel closed");
-                        break;
-                    }
-                }
-            }
+fn derive_identifiers(mapping: &HardwareMapping, controller: &str) -> (String, String) {
+    let hash_base = match (
+        mapping.hardware_type.as_deref(),
+        mapping.hardware_id.as_deref(),
+    ) {
+        (Some(ht), Some(id)) if !ht.is_empty() && !id.is_empty() => {
+            format!("{}_{}", sanitize_identifier(ht), sanitize_identifier(id))
         }
-    }
+        (Some(ht), _) if !ht.is_empty() => sanitize_identifier(ht),
+        (_, Some(id)) if !id.is_empty() => format!("canbus_{}", sanitize_identifier(id)),
+        _ => sanitize_identifier(controller),
+    };
+
+    let topic = format!(
+        "canbus/{}/{}/controls",
+        sanitize_identifier(mapping.hardware_type.as_deref().unwrap_or("unknown")),
+        sanitize_identifier(mapping.hardware_id.as_deref().unwrap_or("unknown"))
+    );
+
+    (hash_base, topic)
+}
+
+fn sanitize_identifier(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+async fn update_connection_status(
+    manager: &ConnectionManager,
+    bus: &BusState,
+    status: &str,
+    last_online: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let now = Utc::now();
+    let last_online = last_online.unwrap_or(now);
+    let payload = json!({
+        "connection_status": status,
+        "last_updated": now.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        "last_online": last_online.to_rfc3339_opts(SecondsFormat::Nanos, true),
+    });
+
+    let mut conn = manager.clone();
+    redis::cmd("HSET")
+        .arg("connections")
+        .arg(bus.redis_hash())
+        .arg(payload.to_string())
+        .query_async::<()>(&mut conn)
+        .await?;
 
     Ok(())
 }
 
-// Get all signals from Redis hash epc_canbus
-async fn get_all_signals_from_redis() -> Result<HashMap<String, f32>> {
-    let mut conn = get_redis_connection().await?;
-    let result: HashMap<String, f32> = redis::cmd("HGETALL")
-        .arg(REDIS_HASH_KEY)
-        .query_async(&mut conn)
-        .await?;
-
-    Ok(result)
+fn spawn_redis_worker(
+    manager: ConnectionManager,
+    mut receiver: mpsc::UnboundedReceiver<RedisCommand>,
+    hash_key: String,
+) {
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            let mut conn = manager.clone();
+            if let Err(err) = redis::cmd("HSET")
+                .arg(&hash_key)
+                .arg(&command.field_key)
+                .arg(command.value)
+                .query_async::<()>(&mut conn)
+                .await
+            {
+                warn!(
+                    redis_hash = %hash_key,
+                    field = %command.field_key,
+                    error = %err,
+                    "Failed to store signal in Redis"
+                );
+            }
+        }
+    });
 }
 
-// Get specific signal value from Redis hash
-async fn get_signal_from_redis(message_name: &str, signal_name: &str) -> Result<Option<f32>> {
-    let mut conn = get_redis_connection().await?;
-    let field_key = format!("{}_{}", message_name, signal_name);
-
-    let result: Option<f32> = redis::cmd("HGET")
-        .arg(REDIS_HASH_KEY)
-        .arg(&field_key)
-        .query_async(&mut conn)
-        .await?;
-
-    Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mqtt_integration::construct_frame_with_signal;
-
-    async fn load_test_dbc() -> Result<can_dbc::DBC> {
-        let mut f = File::open("epc.dbc").await?;
-        let mut buffer = Vec::new();
-        f.read_to_end(&mut buffer).await?;
-        Ok(can_dbc::DBC::from_slice(&buffer).expect("Failed to parse DBC"))
-    }
-
-    #[tokio::test]
-    async fn test_phase_sequence_frame_construction() {
-        // Load the actual DBC file to get real message structures
-        let dbc = load_test_dbc().await.unwrap();
-
-        // Find StatusGridMonitorLoc message
-        let status_grid_msg = dbc
-            .messages()
-            .iter()
-            .find(|msg| msg.message_name() == "StatusGridMonitorLoc")
-            .expect("StatusGridMonitorLoc message not found in DBC");
-
-        let message_id: u32 = match status_grid_msg.message_id() {
-            can_dbc::MessageId::Standard(id) => (*id).into(),
-            can_dbc::MessageId::Extended(id) => *id,
+fn spawn_can_runtime(
+    bus_state: Arc<BusState>,
+    message_data: Arc<RwLock<HashMap<u32, MessageData>>>,
+    mut tx_receiver: mpsc::UnboundedReceiver<CanFrame>,
+    interface: String,
+    redis_manager: Option<ConnectionManager>,
+) {
+    tokio::spawn(async move {
+        let mut socket = match CanSocket::open(&interface) {
+            Ok(socket) => socket,
+            Err(err) => {
+                error!(interface = %interface, error = %err, "Failed to open CAN interface");
+                return;
+            }
         };
-        let can_id = message_id & !EFF_FLAG;
 
-        // Create MessageData with real signals from DBC
-        let mut msg_data = MessageData::new(
-            status_grid_msg.message_name().clone(),
-            status_grid_msg.signals().clone(),
-            *status_grid_msg.message_size() as u8,
-            matches!(
-                status_grid_msg.message_id(),
-                can_dbc::MessageId::Extended(_)
-            ),
-        );
+        let mut last_online: Option<DateTime<Utc>> = None;
 
-        // Check if PhaseSequence signal exists
-        let phase_sequence_signal = status_grid_msg
-            .signals()
-            .iter()
-            .find(|signal| signal.name() == "PhaseSequence");
-
-        assert!(
-            phase_sequence_signal.is_some(),
-            "PhaseSequence signal not found in StatusGridMonitorLoc"
-        );
-
-        // Set PhaseSequence to 1.0
-        let result = msg_data.set_signal_value("PhaseSequence", 1.0);
-        assert!(
-            result.is_ok(),
-            "Failed to set PhaseSequence value: {:?}",
-            result
-        );
-
-        // Try to construct the frame
-        let frame_result = msg_data.construct_frame(can_id);
-        assert!(
-            frame_result.is_ok(),
-            "Failed to construct frame: {:?}",
-            frame_result
-        );
-
-        let frame = frame_result.unwrap();
-        info!(
-            can_id = %format!("0x{:08x}", can_id),
-            "Successfully constructed frame"
-        );
-        debug!(frame_data = ?frame.data(), "Frame data");
-
-        // Verify the frame has the expected properties
-        assert_eq!(frame.data().len(), 8, "Frame should have 8 bytes of data");
-    }
-
-    #[tokio::test]
-    async fn test_multiple_signal_frame_construction() {
-        let dbc = load_test_dbc().await.unwrap();
-
-        // Test with different messages to ensure the frame construction works generally
-        let test_messages = [
-            "StatusGridMonitorLoc",
-            "StatusInverterPhaseArm",
-            "StatusInverterAcuate",
-        ];
-
-        for msg_name in &test_messages {
-            if let Some(msg) = dbc.messages().iter().find(|m| m.message_name() == msg_name) {
-                let message_id: u32 = match msg.message_id() {
-                    can_dbc::MessageId::Standard(id) => (*id).into(),
-                    can_dbc::MessageId::Extended(id) => *id,
-                };
-                let can_id = message_id & !EFF_FLAG;
-
-                let mut msg_data = MessageData::new(
-                    msg.message_name().clone(),
-                    msg.signals().clone(),
-                    *msg.message_size() as u8,
-                    matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
+        if let Some(manager) = redis_manager.clone() {
+            if let Err(err) =
+                update_connection_status(&manager, &bus_state, "Connected", None).await
+            {
+                warn!(
+                    interface = %interface,
+                    error = %err,
+                    "Failed to publish initial connection status"
                 );
-
-                // Set first signal to a test value if it exists
-                if let Some(first_signal) = msg.signals().first() {
-                    let result = msg_data.set_signal_value(first_signal.name(), 42.0);
-                    assert!(
-                        result.is_ok(),
-                        "Failed to set signal value for {}",
-                        first_signal.name()
-                    );
-
-                    let frame_result = msg_data.construct_frame(can_id);
-                    assert!(
-                        frame_result.is_ok(),
-                        "Failed to construct frame for message {}: {:?}",
-                        msg_name,
-                        frame_result
-                    );
-
-                    info!(message_name = %msg_name, "Successfully constructed frame for message");
-                }
+            } else {
+                last_online = Some(Utc::now());
             }
         }
-    }
 
-    #[tokio::test]
-    async fn test_signal_encoding_decoding_roundtrip() {
-        let dbc = load_test_dbc().await.unwrap();
+        loop {
+            tokio::select! {
+                frame_result = socket.next() => {
+                    match frame_result {
+                        Some(Ok(frame)) => {
+                            let raw_id = match frame.id() {
+                                Id::Standard(id) => id.as_raw() as u32,
+                                Id::Extended(id) => id.as_raw(),
+                            };
+                            let id = raw_id & !EFF_FLAG;
 
-        if let Some(msg) = dbc
-            .messages()
-            .iter()
-            .find(|m| m.message_name() == "StatusGridMonitorLoc")
-        {
-            let message_id: u32 = match msg.message_id() {
-                can_dbc::MessageId::Standard(id) => (*id).into(),
-                can_dbc::MessageId::Extended(id) => *id,
-            };
-            let can_id = message_id & !EFF_FLAG;
+                            let mut data_guard = message_data.write().await;
+                            if let Some(msg_data) = data_guard.get_mut(&id) {
+                                let message_name = msg_data.name.clone();
+                                let changed = msg_data.update_from_frame(&frame);
+                                drop(data_guard);
 
-            let mut msg_data = MessageData::new(
-                msg.message_name().clone(),
-                msg.signals().clone(),
-                *msg.message_size() as u8,
-                matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
-            );
+                                for (signal_name, value) in changed {
+                                    let field_key = format!("{}_{}", message_name, signal_name);
+                                    bus_state.enqueue_redis(RedisCommand {
+                                        field_key,
+                                        value: value as f64,
+                                    });
+                                }
 
-            // Set all signals to known test values
-            let test_values = vec![
-                ("PhaseSequence", 1.0),
-                ("NetworkVoltage", 230.5),
-                ("NetworkFrequency", 50.2),
-            ];
-
-            for (signal_name, value) in &test_values {
-                if msg_data.signal_values.contains_key(*signal_name) {
-                    msg_data.set_signal_value(signal_name, *value).unwrap();
+                                last_online = Some(Utc::now());
+                            } else {
+                                drop(data_guard);
+                                debug!(
+                                    can_id = id,
+                                    interface = %interface,
+                                    "Received frame for unknown CAN ID"
+                                );
+                            }
+                        }
+                        Some(Err(err)) => {
+                            warn!(interface = %interface, error = %err, "CAN socket error");
+                        }
+                        None => {
+                            warn!(interface = %interface, "CAN socket stream ended");
+                            break;
+                        }
+                    }
                 }
-            }
-
-            // Construct frame
-            let frame = msg_data.construct_frame(can_id).unwrap();
-
-            // Create a new MessageData and decode the frame
-            let mut decoded_msg_data = MessageData::new(
-                msg.message_name().clone(),
-                msg.signals().clone(),
-                *msg.message_size() as u8,
-                matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
-            );
-            decoded_msg_data.update_from_frame(&frame);
-
-            // Check that we can retrieve the values (allowing for some precision loss)
-            for (signal_name, expected_value) in &test_values {
-                if let Some(decoded_value) = decoded_msg_data.get_signal_value(signal_name) {
-                    let diff = (decoded_value - expected_value).abs();
-                    assert!(
-                        diff < 0.1,
-                        "Signal {} roundtrip failed: expected {}, got {}",
-                        signal_name,
-                        expected_value,
-                        decoded_value
-                    );
-                    info!(
-                        signal_name = %signal_name,
-                        expected_value = %expected_value,
-                        decoded_value = %decoded_value,
-                        "Signal roundtrip successful"
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_frame_construction_helper_functions() {
-        // Test the helper functions without requiring a real CAN interface
-        // This test verifies the logic of the helper functions even if we can't test actual frame construction
-        // due to missing DBC or CAN interface in test environment
-
-        // We can test that the functions handle missing messages correctly
-        let result = construct_frame_with_signal("NonExistentMessage", "TestSignal", 1.0).await;
-        assert!(result.is_err(), "Should fail when message doesn't exist");
-
-        let error_msg = result.unwrap_err();
-        assert!(
-            error_msg.contains("not found"),
-            "Error should mention message not found"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_debug_phase_sequence_issue() {
-        // This test specifically debugs the PhaseSequence issue
-        let dbc = load_test_dbc().await.unwrap();
-
-        // Print all messages to understand the structure
-        info!("Available messages in DBC:");
-        for msg in dbc.messages() {
-            info!(
-                message_name = %msg.message_name(),
-                message_id = ?msg.message_id(),
-                "DBC message"
-            );
-        }
-
-        // Find and analyze StatusGridMonitorLoc
-        if let Some(msg) = dbc
-            .messages()
-            .iter()
-            .find(|m| m.message_name() == "StatusGridMonitorLoc")
-        {
-            info!("StatusGridMonitorLoc signals:");
-            for signal in msg.signals() {
-                info!(
-                    signal_name = %signal.name(),
-                    start_bit = signal.start_bit(),
-                    size = signal.signal_size(),
-                    byte_order = ?signal.byte_order(),
-                    factor = signal.factor(),
-                    offset = signal.offset(),
-                    "Signal details"
-                );
-            }
-
-            let message_id: u32 = match msg.message_id() {
-                can_dbc::MessageId::Standard(id) => (*id).into(),
-                can_dbc::MessageId::Extended(id) => *id,
-            };
-            let can_id = message_id & !EFF_FLAG;
-            info!(
-                can_id = %format!("0x{:08x}", can_id),
-                raw_message_id = %format!("0x{:08x}", message_id),
-                "CAN ID details"
-            );
-
-            // Try the frame construction that's failing in main
-            let mut message_data: HashMap<u32, MessageData> = HashMap::new();
-            message_data.insert(
-                can_id,
-                MessageData::new(
-                    msg.message_name().clone(),
-                    msg.signals().clone(),
-                    *msg.message_size() as u8,
-                    matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
-                ),
-            );
-
-            let result =
-                construct_frame_with_signal("StatusGridMonitorLoc", "PhaseSequence", 1.0).await;
-
-            match result {
-                Ok((returned_can_id, frame)) => {
-                    info!("SUCCESS: Constructed frame!");
-                    info!(
-                        returned_can_id = %format!("0x{:08x}", returned_can_id),
-                        "Returned CAN ID"
-                    );
-                    debug!(frame_data = ?frame.data(), "Frame data");
-                }
-                Err(e) => {
-                    error!(error = %e, "ERROR constructing frame");
-
-                    // Debug further - check if the signal exists
-                    if let Some(msg_data) = message_data.get(&can_id) {
-                        info!("Signal values in message:");
-                        for (name, value) in &msg_data.signal_values {
-                            info!(
-                                signal_name = %name,
-                                signal_value = %value,
-                                "Signal value"
-                            );
+                maybe_frame = tx_receiver.recv() => {
+                    match maybe_frame {
+                        Some(frame) => {
+                            let data = frame.data().to_vec();
+                            if let Err(err) = socket.write_frame(frame).await {
+                                error!(interface = %interface, error = %err, "Failed to send CAN frame");
+                            } else {
+                                debug!(interface = %interface, frame_data = ?data, "Sent CAN frame");
+                                last_online = Some(Utc::now());
+                            }
+                        }
+                        None => {
+                            warn!(interface = %interface, "CAN TX channel closed");
+                            break;
                         }
                     }
                 }
             }
-        } else {
-            error!("StatusGridMonitorLoc message not found!");
         }
-    }
+
+        if let Some(manager) = redis_manager {
+            if let Err(err) =
+                update_connection_status(&manager, &bus_state, "Disconnected", last_online).await
+            {
+                warn!(
+                    interface = %interface,
+                    error = %err,
+                    "Failed to publish disconnect status"
+                );
+            }
+        }
+    });
 }
