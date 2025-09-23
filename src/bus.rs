@@ -1,8 +1,10 @@
 use crate::message_type::MessageData;
+use can_dbc::MultiplexIndicator;
 use socketcan::CanFrame;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
+use tracing::{info, warn};
 
 #[derive(Clone, Debug)]
 pub struct RedisCommand {
@@ -111,7 +113,90 @@ impl BusState {
             .get_mut(message_id)
             .ok_or_else(|| format!("Message '{}' not found", message_name))?;
 
+        let indicator = msg_data
+            .signals
+            .iter()
+            .find(|signal| signal.name() == signal_name)
+            .map(|signal| *signal.multiplexer_indicator())
+            .ok_or_else(|| {
+                format!(
+                    "Signal '{}' not found in message '{}'",
+                    signal_name, message_name
+                )
+            })?;
+
+        let mux_adjustment = match indicator {
+            MultiplexIndicator::MultiplexedSignal(expected)
+            | MultiplexIndicator::MultiplexorAndMultiplexedSignal(expected) => msg_data
+                .signals
+                .iter()
+                .find(|candidate| {
+                    matches!(
+                        candidate.multiplexer_indicator(),
+                        MultiplexIndicator::Multiplexor
+                            | MultiplexIndicator::MultiplexorAndMultiplexedSignal(_)
+                    )
+                })
+                .map(|mux_signal| {
+                    let factor = *mux_signal.factor();
+                    let offset = *mux_signal.offset();
+                    let physical = (expected as f64) * factor + offset;
+                    (mux_signal.name().clone(), physical as f32, expected)
+                }),
+            _ => None,
+        };
+
         msg_data.set_signal_value(signal_name, new_value)?;
+
+        match (indicator, mux_adjustment) {
+            (
+                MultiplexIndicator::MultiplexedSignal(expected)
+                | MultiplexIndicator::MultiplexorAndMultiplexedSignal(expected),
+                Some((mux_name, mux_value, resolved_expected)),
+            ) => {
+                info!(
+                    message = %message_name,
+                    signal = %signal_name,
+                    value = new_value,
+                    multiplexer_signal = %mux_name,
+                    multiplexer_value = %mux_value,
+                    expected_mux = expected,
+                    resolved_expected = resolved_expected,
+                    "Applied multiplexer adjustment for CAN signal update"
+                );
+                msg_data.signal_values.insert(mux_name, mux_value);
+            }
+            (
+                MultiplexIndicator::MultiplexedSignal(expected)
+                | MultiplexIndicator::MultiplexorAndMultiplexedSignal(expected),
+                None,
+            ) => {
+                warn!(
+                    message = %message_name,
+                    signal = %signal_name,
+                    value = new_value,
+                    expected_mux = expected,
+                    "Unable to locate multiplexer signal for multiplexed update"
+                );
+            }
+            (MultiplexIndicator::Multiplexor, _) => {
+                info!(
+                    message = %message_name,
+                    signal = %signal_name,
+                    value = new_value,
+                    "Prepared multiplexer signal update"
+                );
+            }
+            (MultiplexIndicator::Plain, _) => {
+                info!(
+                    message = %message_name,
+                    signal = %signal_name,
+                    value = new_value,
+                    "Prepared CAN signal update"
+                );
+            }
+        }
+
         let frame = msg_data.construct_frame(*message_id)?;
 
         Ok((*message_id, frame))
