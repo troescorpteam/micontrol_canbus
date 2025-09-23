@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -292,6 +293,47 @@ async fn update_connection_status(
     Ok(())
 }
 
+struct LastFrameSummary {
+    timestamp: DateTime<Utc>,
+    raw_id: u32,
+    is_extended: bool,
+    dlc: usize,
+    message_name: Option<String>,
+    changed_signals: Vec<(String, f32)>,
+    data: Vec<u8>,
+}
+
+fn format_frame_bytes(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "empty".to_string();
+    }
+
+    data.iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_frame_id(raw_id: u32, is_extended: bool) -> String {
+    if is_extended {
+        format!("0x{:08X}", raw_id)
+    } else {
+        format!("0x{:03X}", raw_id)
+    }
+}
+
+fn format_changed_signals(changed: &[(String, f32)]) -> String {
+    if changed.is_empty() {
+        return "none".to_string();
+    }
+
+    changed
+        .iter()
+        .map(|(name, value)| format!("{}={:.3}", name, value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn spawn_redis_worker(
     manager: ConnectionManager,
     mut receiver: mpsc::UnboundedReceiver<RedisCommand>,
@@ -350,6 +392,16 @@ fn spawn_can_runtime(
             }
         }
 
+        let mut log_interval = time::interval_at(
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        log_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut last_frame_info: Option<LastFrameSummary> = None;
+        let mut frames_since_log: u64 = 0;
+        let mut total_frames: u64 = 0;
+
         loop {
             tokio::select! {
                 frame_result = socket.next() => {
@@ -360,29 +412,69 @@ fn spawn_can_runtime(
                                 Id::Extended(id) => id.as_raw(),
                             };
                             let id = raw_id & !EFF_FLAG;
+                            let is_extended = matches!(frame.id(), Id::Extended(_));
+                            let dlc = frame.data().len();
+                            let frame_bytes = frame.data().to_vec();
+                            let now = Utc::now();
 
-                            let mut data_guard = message_data.write().await;
-                            if let Some(msg_data) = data_guard.get_mut(&id) {
-                                let message_name = msg_data.name.clone();
-                                let changed = msg_data.update_from_frame(&frame);
-                                drop(data_guard);
+                            let (message_name, changed_signals) = {
+                                let mut data_guard = message_data.write().await;
+                                if let Some(msg_data) = data_guard.get_mut(&id) {
+                                    let message_name = msg_data.name.clone();
+                                    let changes = msg_data.update_from_frame(&frame);
+                                    (Some(message_name), changes)
+                                } else {
+                                    debug!(
+                                        can_id = id,
+                                        interface = %interface,
+                                        "Received frame for unknown CAN ID"
+                                    );
+                                    (None, Vec::new())
+                                }
+                            };
 
-                                for (signal_name, value) in changed {
+                            if let Some(message_name) = message_name.as_ref() {
+                                for (signal_name, value) in &changed_signals {
                                     let field_key = format!("{}_{}", message_name, signal_name);
                                     bus_state.enqueue_redis(RedisCommand {
                                         field_key,
-                                        value: value as f64,
+                                        value: *value as f64,
                                     });
                                 }
+                            }
 
-                                last_online = Some(Utc::now());
-                            } else {
-                                drop(data_guard);
-                                debug!(
-                                    can_id = id,
-                                    interface = %interface,
-                                    "Received frame for unknown CAN ID"
-                                );
+                            let first_frame = total_frames == 0;
+                            total_frames += 1;
+                            frames_since_log += 1;
+                            last_online = Some(now);
+
+                            let summary = LastFrameSummary {
+                                timestamp: now,
+                                raw_id,
+                                is_extended,
+                                dlc,
+                                message_name: message_name.clone(),
+                                changed_signals: changed_signals.clone(),
+                                data: frame_bytes,
+                            };
+                            last_frame_info = Some(summary);
+
+                            if first_frame {
+                                if let Some(summary) = last_frame_info.as_ref() {
+                                    let id_str = format_frame_id(summary.raw_id, summary.is_extended);
+                                    let message = summary.message_name.as_deref().unwrap_or("unknown");
+                                    let data = format_frame_bytes(&summary.data);
+                                    let changed = format_changed_signals(&summary.changed_signals);
+                                    info!(
+                                        interface = %interface,
+                                        can_id = %id_str,
+                                        message = %message,
+                                        dlc = summary.dlc,
+                                        changed_signals = %changed,
+                                        frame_data = %data,
+                                        "First CAN frame received"
+                                    );
+                                }
                             }
                         }
                         Some(Err(err)) => {
@@ -408,6 +500,101 @@ fn spawn_can_runtime(
                         None => {
                             warn!(interface = %interface, "CAN TX channel closed");
                             break;
+                        }
+                    }
+                }
+                _ = log_interval.tick() => {
+                    if frames_since_log > 0 {
+                        if let Some(summary) = last_frame_info.as_ref() {
+                            let id_str = format_frame_id(summary.raw_id, summary.is_extended);
+                            let message = summary.message_name.as_deref().unwrap_or("unknown");
+                            let data = format_frame_bytes(&summary.data);
+                            let changed = format_changed_signals(&summary.changed_signals);
+                            let timestamp = summary.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
+                            info!(
+                                interface = %interface,
+                                frames_in_interval = frames_since_log,
+                                total_frames = total_frames,
+                                last_frame_timestamp = %timestamp,
+                                last_frame_id = %id_str,
+                                last_frame_message = %message,
+                                last_frame_dlc = summary.dlc,
+                                last_frame_changed = %changed,
+                                last_frame_data = %data,
+                                "CAN activity in the last 10s"
+                            );
+
+                            if let Some(manager) = redis_manager.clone() {
+                                if let Err(err) = update_connection_status(
+                                    &manager,
+                                    &bus_state,
+                                    "Connected",
+                                    Some(summary.timestamp),
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        interface = %interface,
+                                        error = %err,
+                                        "Failed to refresh connection status"
+                                    );
+                                }
+                            }
+                        } else {
+                            info!(
+                                interface = %interface,
+                                frames_in_interval = frames_since_log,
+                                total_frames = total_frames,
+                                "Received CAN frames but missing summary metadata"
+                            );
+                        }
+                        frames_since_log = 0;
+                    } else if let Some(summary) = last_frame_info.as_ref() {
+                        let timestamp = summary.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
+                        info!(
+                            interface = %interface,
+                            total_frames = total_frames,
+                            last_frame_timestamp = %timestamp,
+                            "No CAN frames received in the last 10s"
+                        );
+
+                        if let Some(manager) = redis_manager.clone() {
+                            if let Err(err) = update_connection_status(
+                                &manager,
+                                &bus_state,
+                                "Connected",
+                                Some(summary.timestamp),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    interface = %interface,
+                                    error = %err,
+                                    "Failed to refresh connection status"
+                                );
+                            }
+                        }
+                    } else {
+                        info!(
+                            interface = %interface,
+                            "No CAN frames received yet on this interface"
+                        );
+
+                        if let Some(manager) = redis_manager.clone() {
+                            if let Err(err) = update_connection_status(
+                                &manager,
+                                &bus_state,
+                                "Connected",
+                                None,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    interface = %interface,
+                                    error = %err,
+                                    "Failed to refresh connection status"
+                                );
+                            }
                         }
                     }
                 }
