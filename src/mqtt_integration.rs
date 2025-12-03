@@ -1,11 +1,10 @@
 use crate::bus::{BusManager, BusState, RedisCommand};
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::mqttbytes::v5::SubscribeProperties;
-use rumqttc::v5::{AsyncClient, MqttOptions};
+use rumqttc::v5::mqttbytes::v5::{Packet, Publish, SubscribeProperties};
+use rumqttc::v5::{AsyncClient, Event, MqttOptions};
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::Value as JsonValue;
 use std::{env, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -27,14 +26,18 @@ pub struct SignalUpdatePayload {
     pub control_requested_time_utc: Option<String>,
 }
 
-/// Lazy static initialization of the MQTT client using Arc for thread safety.
-pub static MQTT_CLIENT: Lazy<Arc<Mutex<Option<AsyncClient>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+pub struct MqttService {
+    client: Arc<Mutex<Option<AsyncClient>>>,
+}
 
-pub struct MqttIntegration;
+impl MqttService {
+    pub fn new() -> Self {
+        Self {
+            client: Arc::new(Mutex::new(None)),
+        }
+    }
 
-impl MqttIntegration {
-    pub async fn setup_mqtt_client(bus_manager: Arc<BusManager>) {
+    pub async fn run(self: Arc<Self>, bus_manager: Arc<BusManager>) {
         const MAX_RETRIES: u32 = 5;
         const INITIAL_RETRY_DELAY_MS: u64 = 1000;
         const MAX_RETRY_DELAY_MS: u64 = 30000;
@@ -66,12 +69,18 @@ impl MqttIntegration {
             mqtt_options.set_manual_acks(false);
 
             let (mqtt_client, mut mqtt_eventloop) = AsyncClient::new(mqtt_options, 30);
-            *MQTT_CLIENT.lock().await = Some(mqtt_client.clone());
+            {
+                let mut guard = self.client.lock().await;
+                *guard = Some(mqtt_client.clone());
+            }
 
             let topics = bus_manager.all_topics().await;
             info!(topics = ?topics, "MQTT client created, setting up subscriptions...");
+            let subscription_service = Arc::clone(&self);
             tokio::spawn(async move {
-                Self::setup_subscriptions(mqtt_client, topics).await;
+                subscription_service
+                    .setup_subscriptions(mqtt_client, topics)
+                    .await;
             });
 
             let mut retry_count = 0;
@@ -79,37 +88,10 @@ impl MqttIntegration {
 
             loop {
                 match mqtt_eventloop.poll().await {
-                    Ok(rumqttc::v5::Event::Incoming(
-                        rumqttc::v5::mqttbytes::v5::Packet::Publish(publish),
-                    )) => {
-                        let topic = String::from_utf8_lossy(&publish.topic).to_string();
-                        let payload = String::from_utf8_lossy(&publish.payload).to_string();
-
-                        if let Some(bus) = bus_manager.bus_by_topic(&topic).await {
-                            debug!(
-                                topic = %topic,
-                                payload = %payload,
-                                "Received MQTT payload"
-                            );
-
-                            match serde_json::from_str::<SignalUpdatePayload>(&payload) {
-                                Ok(parsed_payload) => {
-                                    if let Err(err) =
-                                        handle_payload(Arc::clone(&bus), parsed_payload).await
-                                    {
-                                        error!(
-                                            bus = %bus.controller(),
-                                            error = %err,
-                                            "Failed to process MQTT payload"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(topic = %topic, error = %e, "Failed to parse JSON payload");
-                                }
-                            }
-                        } else {
-                            debug!(topic = %topic, "Ignoring MQTT payload for unrecognised topic");
+                    Ok(Event::Incoming(Packet::Publish(publish))) => {
+                        let manager = Arc::clone(&bus_manager);
+                        if let Err(err) = self.process_publish(manager, publish).await {
+                            error!(error = %err, "Failed to process MQTT publish packet");
                         }
 
                         retry_count = 0;
@@ -141,12 +123,17 @@ impl MqttIntegration {
                 }
             }
 
+            {
+                let mut guard = self.client.lock().await;
+                guard.take();
+            }
+
             tokio::time::sleep(Duration::from_millis(MAX_RETRY_DELAY_MS)).await;
             warn!("Attempting to establish new MQTT connection");
         }
     }
 
-    async fn setup_subscriptions(client: AsyncClient, topics: Vec<String>) {
+    async fn setup_subscriptions(&self, client: AsyncClient, topics: Vec<String>) {
         if topics.is_empty() {
             warn!("No MQTT topics configured; MQTT integration will remain idle");
             return;
@@ -171,6 +158,46 @@ impl MqttIntegration {
         tokio::time::sleep(Duration::from_millis(500)).await;
         info!("MQTT subscription setup complete");
     }
+
+    async fn process_publish(&self, bus_manager: Arc<BusManager>, publish: Publish) -> Result<()> {
+        let topic = String::from_utf8_lossy(&publish.topic).to_string();
+        let payload = String::from_utf8_lossy(&publish.payload).to_string();
+
+        if let Some(bus) = bus_manager.bus_by_topic(&topic).await {
+            debug!(topic = %topic, payload = %payload, "Received MQTT payload");
+            let parsed = serde_json::from_str::<SignalUpdatePayload>(&payload)?;
+            handle_payload(bus, parsed).await
+        } else {
+            debug!(topic = %topic, "Ignoring MQTT payload for unrecognised topic");
+            Ok(())
+        }
+    }
+
+    pub async fn publish_measurement(&self, topic: &str, payload: JsonValue) {
+        let payload_string = payload.to_string();
+        let client = {
+            let guard = self.client.lock().await;
+            guard.as_ref().cloned()
+        };
+
+        if let Some(client) = client {
+            if let Err(err) = client
+                .publish(
+                    topic.to_string(),
+                    QoS::AtLeastOnce,
+                    false,
+                    payload_string.clone(),
+                )
+                .await
+            {
+                warn!(topic = %topic, error = %err, "Failed to publish measurement payload to MQTT");
+            } else {
+                debug!(topic = %topic, payload = %payload_string, "Published measurement payload to MQTT");
+            }
+        } else {
+            debug!(topic = %topic, "MQTT client not available for publishing measurement payload");
+        }
+    }
 }
 
 async fn process_can_signal_update(
@@ -185,7 +212,7 @@ async fn process_can_signal_update(
         .map_err(|e| anyhow::anyhow!("Failed to construct CAN frame: {}", e))?;
 
     bus.enqueue_redis(RedisCommand {
-        field_key: format!("{}_{}", message_name, signal_name),
+        field_key: format!("{}.{}", message_name, signal_name),
         value: new_value as f64,
     });
 
@@ -244,13 +271,13 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
             })
             .ok_or_else(|| anyhow::anyhow!("Failed to extract control payload"))?;
 
-        let mut parts = message_signal.splitn(2, '_');
+        let mut parts = message_signal.splitn(2, '.');
         let message = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("Control key missing message prefix"))?;
+            .ok_or_else(|| anyhow::anyhow!("Control key missing message prefix (expected 'MessageName.SignalName')"))?;
         let signal = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("Control key missing signal suffix"))?;
+            .ok_or_else(|| anyhow::anyhow!("Control key missing signal suffix (expected 'MessageName.SignalName')"))?;
 
         info!(
             bus = %bus.controller(),

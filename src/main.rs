@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use bus::{BusManager, BusState, RedisCommand};
-use can_dbc::DBC;
+use can_dbc::Dbc;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dotenv::dotenv;
 use futures::{StreamExt, future};
+use identifiers::derive_identifiers;
 use message_type::MessageData;
 use redis::aio::ConnectionManager;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value as JsonValue, json};
 use socketcan::{CanFrame, EmbeddedFrame, Id, tokio::CanSocket};
 use std::collections::HashMap;
 use std::env;
@@ -20,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod bus;
+mod identifiers;
 mod message_type;
 mod mqtt_integration;
 
@@ -96,6 +98,7 @@ async fn main() -> Result<()> {
     }
 
     let mappings_to_run = config.all_mappings();
+    let system_name = env::var("SYSTEM_NAME").unwrap_or_else(|_| "micontrol".to_string());
 
     let redis_manager = match init_redis_connection().await {
         Ok(manager) => {
@@ -112,6 +115,7 @@ async fn main() -> Result<()> {
     };
 
     let bus_manager = Arc::new(BusManager::new());
+    let mqtt_service = Arc::new(mqtt_integration::MqttService::new());
 
     for mapping in mappings_to_run {
         let interface = mapping.controller.clone();
@@ -134,7 +138,12 @@ async fn main() -> Result<()> {
         let message_data = Arc::new(RwLock::new(message_store));
         let message_index = Arc::new(message_index);
 
-        let (redis_hash, mqtt_topic) = derive_identifiers(mapping, &interface);
+        let topic_info = derive_identifiers(
+            &system_name,
+            &interface,
+            mapping.hardware_type.as_deref(),
+            mapping.hardware_id.as_deref(),
+        );
 
         let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<CanFrame>();
         let (redis_sender, redis_rx) = if redis_manager.is_some() {
@@ -149,8 +158,9 @@ async fn main() -> Result<()> {
             bus_id.clone(),
             mapping.controller.clone(),
             interface.clone(),
-            redis_hash.clone(),
-            mqtt_topic.clone(),
+            topic_info.redis_hash.clone(),
+            topic_info.control_topic.clone(),
+            topic_info.measurement_topic.clone(),
             mapping.hardware_type.clone(),
             mapping.hardware_id.clone(),
             Arc::clone(&message_data),
@@ -162,22 +172,26 @@ async fn main() -> Result<()> {
         bus_manager.insert(Arc::clone(&bus_state)).await;
 
         if let (Some(manager), Some(rx)) = (redis_manager.clone(), redis_rx) {
-            spawn_redis_worker(manager, rx, redis_hash.clone());
+            spawn_redis_worker(manager, rx, topic_info.redis_hash.clone());
         }
 
         spawn_can_runtime(
             bus_state,
-            message_data,
             tx_receiver,
             interface,
             redis_manager.clone(),
+            Arc::clone(&mqtt_service),
         );
     }
 
-    let mqtt_bus_manager = Arc::clone(&bus_manager);
-    tokio::spawn(async move {
-        mqtt_integration::MqttIntegration::setup_mqtt_client(mqtt_bus_manager).await;
-    });
+    // Start MQTT service AFTER all buses are registered
+    {
+        let service = Arc::clone(&mqtt_service);
+        let manager = Arc::clone(&bus_manager);
+        tokio::spawn(async move {
+            service.run(manager).await;
+        });
+    }
 
     info!("Runtime initialized for all configured CAN buses");
     future::pending::<()>().await;
@@ -206,66 +220,39 @@ async fn init_redis_connection() -> Result<ConnectionManager> {
     Ok(manager)
 }
 
-async fn load_dbc(path: &str) -> Result<DBC> {
+async fn load_dbc(path: &str) -> Result<Dbc> {
     let bytes = fs::read(path)
         .await
         .with_context(|| format!("Failed to read DBC file '{path}'"))?;
-    DBC::from_slice(&bytes)
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("DBC file '{path}' is not valid UTF-8"))?;
+    Dbc::try_from(content.as_str())
         .map_err(|err| anyhow::anyhow!("Failed to parse DBC file '{path}': {:?}", err))
 }
 
-fn build_message_store(dbc: &DBC) -> (HashMap<u32, MessageData>, HashMap<String, u32>) {
+fn build_message_store(dbc: &Dbc) -> (HashMap<u32, MessageData>, HashMap<String, u32>) {
     let mut message_map = HashMap::new();
     let mut name_index = HashMap::new();
 
-    for msg in dbc.messages() {
-        let message_id: u32 = match msg.message_id() {
-            can_dbc::MessageId::Standard(id) => (*id).into(),
-            can_dbc::MessageId::Extended(id) => *id,
+    for msg in &dbc.messages {
+        let message_id: u32 = match msg.id {
+            can_dbc::MessageId::Standard(id) => id.into(),
+            can_dbc::MessageId::Extended(id) => id,
         };
         let id = message_id & !EFF_FLAG;
-        name_index.insert(msg.message_name().clone(), id);
+        name_index.insert(msg.name.clone(), id);
         message_map.insert(
             id,
             MessageData::new(
-                msg.message_name().clone(),
-                msg.signals().clone(),
-                *msg.message_size() as u8,
-                matches!(msg.message_id(), can_dbc::MessageId::Extended(_)),
+                msg.name.clone(),
+                msg.signals.clone(),
+                msg.size as u8,
+                matches!(msg.id, can_dbc::MessageId::Extended(_)),
             ),
         );
     }
 
     (message_map, name_index)
-}
-
-fn derive_identifiers(mapping: &HardwareMapping, controller: &str) -> (String, String) {
-    let hash_base = match (
-        mapping.hardware_type.as_deref(),
-        mapping.hardware_id.as_deref(),
-    ) {
-        (Some(ht), Some(id)) if !ht.is_empty() && !id.is_empty() => {
-            format!("{}_{}", sanitize_identifier(ht), sanitize_identifier(id))
-        }
-        (Some(ht), _) if !ht.is_empty() => sanitize_identifier(ht),
-        (_, Some(id)) if !id.is_empty() => format!("canbus_{}", sanitize_identifier(id)),
-        _ => sanitize_identifier(controller),
-    };
-
-    let topic = format!(
-        "canbus/{}/{}/controls",
-        sanitize_identifier(mapping.hardware_type.as_deref().unwrap_or("unknown")),
-        sanitize_identifier(mapping.hardware_id.as_deref().unwrap_or("unknown"))
-    );
-
-    (hash_base, topic)
-}
-
-fn sanitize_identifier(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 async fn update_connection_status(
@@ -362,11 +349,14 @@ fn spawn_redis_worker(
 
 fn spawn_can_runtime(
     bus_state: Arc<BusState>,
-    message_data: Arc<RwLock<HashMap<u32, MessageData>>>,
     mut tx_receiver: mpsc::UnboundedReceiver<CanFrame>,
     interface: String,
     redis_manager: Option<ConnectionManager>,
+    mqtt_service: Arc<mqtt_integration::MqttService>,
 ) {
+    let frame_store = bus_state.frame_store();
+    let message_data = frame_store.data();
+    let bus_state_handle = Arc::clone(&bus_state);
     tokio::spawn(async move {
         let mut socket = match CanSocket::open(&interface) {
             Ok(socket) => socket,
@@ -375,6 +365,8 @@ fn spawn_can_runtime(
                 return;
             }
         };
+
+        let bus_state = bus_state_handle;
 
         let mut last_online: Option<DateTime<Utc>> = None;
 
@@ -434,12 +426,35 @@ fn spawn_can_runtime(
                             };
 
                             if let Some(message_name) = message_name.as_ref() {
+                                let mut measurement_payload = Map::new();
+
                                 for (signal_name, value) in &changed_signals {
-                                    let field_key = format!("{}_{}", message_name, signal_name);
+                                    let field_key = format!("{}.{}", message_name, signal_name);
                                     bus_state.enqueue_redis(RedisCommand {
                                         field_key,
                                         value: *value as f64,
                                     });
+
+                                    let measurement_key =
+                                        format!("{}.{}", message_name, signal_name);
+                                    measurement_payload
+                                        .insert(measurement_key, json!(f64::from(*value)));
+                                }
+
+                                if !measurement_payload.is_empty() {
+                                    let timestamp_str =
+                                        now.to_rfc3339_opts(SecondsFormat::Millis, true);
+                                    measurement_payload
+                                        .insert("fetched_time_utc".into(), json!(timestamp_str));
+                                    measurement_payload
+                                        .insert("status".into(), json!("ok"));
+
+                                    mqtt_service
+                                        .publish_measurement(
+                                            bus_state.measurement_topic(),
+                                            JsonValue::Object(measurement_payload),
+                                        )
+                                        .await;
                                 }
                             }
 

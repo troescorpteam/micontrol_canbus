@@ -32,9 +32,9 @@ impl MessageData {
         let mut default_signal_values = HashMap::new();
 
         for signal in &signals {
-            let default_value = *signal.offset() as f32;
-            signal_values.insert(signal.name().clone(), default_value);
-            default_signal_values.insert(signal.name().clone(), default_value);
+            let default_value = signal.offset as f32;
+            signal_values.insert(signal.name.clone(), default_value);
+            default_signal_values.insert(signal.name.clone(), default_value);
         }
 
         Self {
@@ -55,14 +55,14 @@ impl MessageData {
                 let calculated_value = calculated_value as f32;
                 let current_value = self
                     .signal_values
-                    .get(signal.name())
+                    .get(&signal.name)
                     .copied()
                     .unwrap_or_default();
 
                 if (calculated_value - current_value).abs() > f32::EPSILON {
-                    changed_signals.push((signal.name().clone(), calculated_value));
+                    changed_signals.push((signal.name.clone(), calculated_value));
                     self.signal_values
-                        .insert(signal.name().clone(), calculated_value);
+                        .insert(signal.name.clone(), calculated_value);
                 }
             }
         }
@@ -109,11 +109,11 @@ impl MessageData {
 
             let signal_value = self
                 .signal_values
-                .get(signal.name())
-                .ok_or_else(|| format!("Signal '{}' value not found", signal.name()))?;
+                .get(&signal.name)
+                .ok_or_else(|| format!("Signal '{}' value not found", signal.name))?;
 
             encode_signal(signal, *signal_value as f64, &mut frame_data)
-                .map_err(|e| format!("Failed to encode signal '{}': {}", signal.name(), e))?;
+                .map_err(|e| format!("Failed to encode signal '{}': {}", signal.name, e))?;
         }
 
         // Create the CAN frame with the encoded data
@@ -147,14 +147,14 @@ impl MessageData {
 
     // Determine if a signal should be encoded based on the current MUX value
     fn should_encode_signal(&self, signal: &Signal, mux_values: &HashMap<String, u64>) -> bool {
-        match signal.multiplexer_indicator() {
+        match signal.multiplexer_indicator {
             MultiplexIndicator::Plain => true,
             MultiplexIndicator::Multiplexor => true,
             MultiplexIndicator::MultiplexedSignal(expected) => {
-                self.mux_matches(*expected, mux_values)
+                self.mux_matches(expected, mux_values)
             }
             MultiplexIndicator::MultiplexorAndMultiplexedSignal(expected) => {
-                mux_values.contains_key(signal.name()) || self.mux_matches(*expected, mux_values)
+                mux_values.contains_key(&signal.name) || self.mux_matches(expected, mux_values)
             }
         }
     }
@@ -163,14 +163,14 @@ impl MessageData {
         let mut values = HashMap::new();
 
         for signal in &self.signals {
-            match signal.multiplexer_indicator() {
+            match signal.multiplexer_indicator {
                 MultiplexIndicator::Multiplexor
                 | MultiplexIndicator::MultiplexorAndMultiplexedSignal(_) => {
-                    if let Some(value) = self.signal_values.get(signal.name()) {
-                        let bit_length = *signal.signal_size() as usize;
+                    if let Some(value) = self.signal_values.get(&signal.name) {
+                        let bit_length = signal.size as usize;
                         if let Ok(raw) = convert_physical_to_raw(signal, *value as f64, bit_length)
                         {
-                            values.insert(signal.name().clone(), raw);
+                            values.insert(signal.name.clone(), raw);
                         }
                     }
                 }
@@ -191,15 +191,15 @@ impl MessageData {
 }
 
 fn decode_signal(signal: &Signal, data: &[u8]) -> Option<f64> {
-    let bit_length = *signal.signal_size() as usize;
+    let bit_length = signal.size as usize;
     if bit_length == 0 {
         return None;
     }
 
-    match signal.byte_order() {
+    match signal.byte_order {
         ByteOrder::LittleEndian => {
             let bits = data.view_bits::<Lsb0>();
-            let start = *signal.start_bit() as usize;
+            let start = signal.start_bit as usize;
             let end = start.checked_add(bit_length)?;
             if end > bits.len() {
                 return None;
@@ -216,7 +216,7 @@ fn decode_signal(signal: &Signal, data: &[u8]) -> Option<f64> {
         }
         ByteOrder::BigEndian => {
             let bits = data.view_bits::<Msb0>();
-            let start = motorola_start_bit_index(*signal.start_bit() as usize);
+            let start = motorola_start_bit_index(signal.start_bit as usize);
             let end = start.checked_add(bit_length)?;
             if end > bits.len() {
                 return None;
@@ -236,7 +236,7 @@ fn decode_signal(signal: &Signal, data: &[u8]) -> Option<f64> {
 }
 
 fn encode_signal(signal: &Signal, value: f64, frame_data: &mut [u8]) -> Result<(), &'static str> {
-    let bit_length = *signal.signal_size() as usize;
+    let bit_length = signal.size as usize;
     if bit_length == 0 {
         return Ok(());
     }
@@ -250,10 +250,10 @@ fn encode_signal(signal: &Signal, value: f64, frame_data: &mut [u8]) -> Result<(
 
     let raw = convert_physical_to_raw(signal, value, bit_length)?;
 
-    match signal.byte_order() {
+    match signal.byte_order {
         ByteOrder::LittleEndian => {
             let bits = frame_data.view_bits_mut::<Lsb0>();
-            let start = *signal.start_bit() as usize;
+            let start = signal.start_bit as usize;
             let end = start
                 .checked_add(bit_length)
                 .ok_or("signal exceeds limits")?;
@@ -268,7 +268,7 @@ fn encode_signal(signal: &Signal, value: f64, frame_data: &mut [u8]) -> Result<(
         }
         ByteOrder::BigEndian => {
             let bits = frame_data.view_bits_mut::<Msb0>();
-            let start = motorola_start_bit_index(*signal.start_bit() as usize);
+            let start = motorola_start_bit_index(signal.start_bit as usize);
             let end = start
                 .checked_add(bit_length)
                 .ok_or("signal exceeds limits")?;
@@ -288,16 +288,16 @@ fn encode_signal(signal: &Signal, value: f64, frame_data: &mut [u8]) -> Result<(
 }
 
 fn apply_signal_scaling(signal: &Signal, raw: u64) -> f64 {
-    let bit_length = *signal.signal_size() as usize;
+    let bit_length = signal.size as usize;
 
-    let value = if matches!(signal.value_type(), ValueType::Signed) {
+    let value = if matches!(signal.value_type, ValueType::Signed) {
         let signed = sign_extend(raw, bit_length);
         signed as f64
     } else {
         raw as f64
     };
 
-    value * *signal.factor() + *signal.offset()
+    value * signal.factor + signal.offset
 }
 
 fn convert_physical_to_raw(
@@ -309,8 +309,8 @@ fn convert_physical_to_raw(
         return Ok(0);
     }
 
-    let factor = *signal.factor();
-    let offset = *signal.offset();
+    let factor = signal.factor;
+    let offset = signal.offset;
 
     let raw_unbounded = if factor.abs() < f64::EPSILON {
         0.0
@@ -318,7 +318,7 @@ fn convert_physical_to_raw(
         (value - offset) / factor
     };
 
-    if matches!(signal.value_type(), ValueType::Signed) {
+    if matches!(signal.value_type, ValueType::Signed) {
         let max = if bit_length == 64 {
             i64::MAX as i128
         } else {
@@ -360,11 +360,11 @@ fn convert_physical_to_raw(
 }
 
 fn required_bytes_for_signal(signal: &Signal) -> usize {
-    let bits = match signal.byte_order() {
-        ByteOrder::LittleEndian => *signal.start_bit() as usize + *signal.signal_size() as usize,
+    let bits = match signal.byte_order {
+        ByteOrder::LittleEndian => signal.start_bit as usize + signal.size as usize,
         ByteOrder::BigEndian => {
-            let start = motorola_start_bit_index(*signal.start_bit() as usize);
-            start + *signal.signal_size() as usize
+            let start = motorola_start_bit_index(signal.start_bit as usize);
+            start + signal.size as usize
         }
     };
 

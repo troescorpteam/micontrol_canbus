@@ -1,5 +1,5 @@
 [[hardware_mappings]]
-hardware_configurations = ["epc"]
+hardware_configurations = ["epc-2"]
 controller = "can0"
 protocol = "CANBUS"
 hardware_type = "bams"
