@@ -272,12 +272,14 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
             .ok_or_else(|| anyhow::anyhow!("Failed to extract control payload"))?;
 
         let mut parts = message_signal.splitn(2, '.');
-        let message = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Control key missing message prefix (expected 'MessageName.SignalName')"))?;
-        let signal = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Control key missing signal suffix (expected 'MessageName.SignalName')"))?;
+        let message = parts.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Control key missing message prefix (expected 'MessageName.SignalName')"
+            )
+        })?;
+        let signal = parts.next().ok_or_else(|| {
+            anyhow::anyhow!("Control key missing signal suffix (expected 'MessageName.SignalName')")
+        })?;
 
         info!(
             bus = %bus.controller(),
