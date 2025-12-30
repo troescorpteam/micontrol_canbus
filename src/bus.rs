@@ -1,5 +1,6 @@
 use crate::message_type::MessageData;
 use can_dbc::MultiplexIndicator;
+use dashmap::DashMap;
 use socketcan::CanFrame;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,13 +36,13 @@ impl RedisPublisher {
 
 #[derive(Clone)]
 pub struct FrameStore {
-    message_data: Arc<RwLock<HashMap<u32, MessageData>>>,
+    message_data: Arc<DashMap<u32, MessageData>>,
     message_index: Arc<HashMap<String, u32>>,
 }
 
 impl FrameStore {
     pub fn new(
-        message_data: Arc<RwLock<HashMap<u32, MessageData>>>,
+        message_data: Arc<DashMap<u32, MessageData>>,
         message_index: Arc<HashMap<String, u32>>,
     ) -> Self {
         Self {
@@ -50,7 +51,7 @@ impl FrameStore {
         }
     }
 
-    pub fn data(&self) -> Arc<RwLock<HashMap<u32, MessageData>>> {
+    pub fn data(&self) -> Arc<DashMap<u32, MessageData>> {
         Arc::clone(&self.message_data)
     }
 
@@ -64,14 +65,14 @@ impl FrameStore {
         signal_name: &str,
         new_value: f32,
     ) -> Result<(u32, CanFrame), String> {
-        let message_id = self
+        let message_id = *self
             .message_index
             .get(message_name)
             .ok_or_else(|| format!("Message '{}' not found", message_name))?;
 
-        let mut message_data = self.message_data.write().await;
-        let msg_data = message_data
-            .get_mut(message_id)
+        let mut msg_data = self
+            .message_data
+            .get_mut(&message_id)
             .ok_or_else(|| format!("Message '{}' not found", message_name))?;
 
         let indicator = msg_data
@@ -158,9 +159,9 @@ impl FrameStore {
             }
         }
 
-        let frame = msg_data.construct_frame(*message_id)?;
+        let frame = msg_data.construct_frame(message_id)?;
 
-        Ok((*message_id, frame))
+        Ok((message_id, frame))
     }
 }
 
@@ -194,7 +195,7 @@ impl BusState {
         measurement_topic: String,
         hardware_type: Option<String>,
         hardware_id: Option<String>,
-        message_data: Arc<RwLock<HashMap<u32, MessageData>>>,
+        message_data: Arc<DashMap<u32, MessageData>>,
         message_index: Arc<HashMap<String, u32>>,
         tx_sender: mpsc::UnboundedSender<CanFrame>,
         redis_sender: Option<mpsc::UnboundedSender<RedisCommand>>,

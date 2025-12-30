@@ -393,3 +393,145 @@ fn sign_extend(value: u64, bits: usize) -> i64 {
         ((value << shift) as i64) >> shift
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_signal(
+        name: &str,
+        start_bit: u64,
+        size: u64,
+        byte_order: ByteOrder,
+        multiplexer_indicator: MultiplexIndicator,
+        factor: f64,
+        offset: f64,
+    ) -> Signal {
+        Signal {
+            name: name.to_string(),
+            multiplexer_indicator,
+            start_bit,
+            size,
+            byte_order,
+            value_type: ValueType::Unsigned,
+            factor,
+            offset,
+            min: 0.0,
+            max: 0.0,
+            unit: "".to_string(),
+            receivers: vec![],
+        }
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_little_endian() {
+        let signal = build_signal(
+            "Speed",
+            0,
+            16,
+            ByteOrder::LittleEndian,
+            MultiplexIndicator::Plain,
+            0.1,
+            0.0,
+        );
+
+        let expected_value = 12.3_f32;
+        let mut encoder = MessageData::new("Msg".into(), vec![signal.clone()], 2, false);
+        encoder
+            .set_signal_value("Speed", expected_value)
+            .expect("signal exists");
+
+        let frame = encoder.construct_frame(0x123).expect("frame created");
+
+        let mut decoder = MessageData::new("Msg".into(), vec![signal], 2, false);
+        let changes = decoder.update_from_frame(&frame);
+
+        let decoded = decoder.get_signal_value("Speed").unwrap();
+        assert!(
+            (decoded - expected_value).abs() < 0.001,
+            "expected {expected_value}, got {decoded}"
+        );
+        assert_eq!(
+            changes,
+            vec![("Speed".to_string(), decoded)],
+            "expected change was reported"
+        );
+    }
+
+    #[test]
+    fn multiplexed_signal_respects_mux_value() {
+        let mux_signal = build_signal(
+            "Mux",
+            0,
+            4,
+            ByteOrder::LittleEndian,
+            MultiplexIndicator::Multiplexor,
+            1.0,
+            0.0,
+        );
+        let muxed_one = build_signal(
+            "SignalA",
+            8,
+            8,
+            ByteOrder::LittleEndian,
+            MultiplexIndicator::MultiplexedSignal(1),
+            1.0,
+            0.0,
+        );
+        let muxed_two = build_signal(
+            "SignalB",
+            16,
+            8,
+            ByteOrder::LittleEndian,
+            MultiplexIndicator::MultiplexedSignal(2),
+            1.0,
+            0.0,
+        );
+
+        let mut encoder = MessageData::new(
+            "MuxedMsg".into(),
+            vec![mux_signal.clone(), muxed_one.clone(), muxed_two.clone()],
+            3,
+            false,
+        );
+        encoder
+            .set_signal_value("Mux", 1.0)
+            .expect("mux signal exists");
+        encoder
+            .set_signal_value("SignalA", 99.0)
+            .expect("muxed signal exists");
+        encoder
+            .set_signal_value("SignalB", 55.0)
+            .expect("muxed signal exists");
+
+        let frame = encoder.construct_frame(0x1FF).expect("frame created");
+
+        let mut decoder = MessageData::new(
+            "MuxedMsg".into(),
+            vec![mux_signal, muxed_one, muxed_two],
+            3,
+            false,
+        );
+        let changes = decoder.update_from_frame(&frame);
+
+        let mux_value = decoder.get_signal_value("Mux").unwrap();
+        let a_value = decoder.get_signal_value("SignalA").unwrap();
+        let b_value = decoder.get_signal_value("SignalB").unwrap();
+
+        assert_eq!(mux_value, 1.0);
+        assert_eq!(a_value, 99.0);
+        assert_eq!(
+            b_value, 0.0,
+            "SignalB should be ignored for mux value 1 and stay at default"
+        );
+
+        assert!(
+            changes.iter().any(|(name, _)| name == "SignalA"),
+            "SignalA should report a change"
+        );
+        assert!(
+            changes.iter().all(|(name, _)| name != "SignalB"),
+            "SignalB should not be reported as changed"
+        );
+    }
+}

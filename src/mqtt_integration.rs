@@ -295,3 +295,94 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
 
     anyhow::bail!("Unsupported MQTT payload format")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_type::MessageData;
+    use can_dbc::{ByteOrder, MultiplexIndicator, Signal, ValueType};
+    use dashmap::DashMap;
+    use serde_json::json;
+    use socketcan::CanFrame;
+    use socketcan::Id;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    fn build_signal(
+        name: &str,
+        start_bit: u64,
+        size: u64,
+        byte_order: ByteOrder,
+    ) -> Signal {
+        Signal {
+            name: name.to_string(),
+            multiplexer_indicator: MultiplexIndicator::Plain,
+            start_bit,
+            size,
+            byte_order,
+            value_type: ValueType::Unsigned,
+            factor: 1.0,
+            offset: 0.0,
+            min: 0.0,
+            max: 0.0,
+            unit: "".to_string(),
+            receivers: vec![],
+        }
+    }
+
+    fn build_bus(tx: mpsc::UnboundedSender<CanFrame>) -> Arc<BusState> {
+        let signal = build_signal("Signal", 0, 8, ByteOrder::LittleEndian);
+        let message_id = 0x321;
+
+        let mut index = HashMap::new();
+        index.insert("Cmd".to_string(), message_id);
+
+        let mut map = DashMap::new();
+        map.insert(
+            message_id,
+            MessageData::new("Cmd".into(), vec![signal], 1, false),
+        );
+
+        Arc::new(BusState::new(
+            "bus1".into(),
+            "can0".into(),
+            "can0".into(),
+            "redis_hash".into(),
+            "controls".into(),
+            "measurements".into(),
+            None,
+            None,
+            Arc::new(map),
+            Arc::new(index),
+            tx,
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn control_payload_enqueues_can_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            message_name: None,
+            signal_name: None,
+            new_value: None,
+            control_id: Some("ctrl-1".into()),
+            control: Some(json!({ "Cmd.Signal": 7 })),
+            control_requested_time_utc: None,
+        };
+
+        handle_payload(bus.clone(), payload)
+            .await
+            .expect("payload should be handled");
+
+        let frame = rx.try_recv().expect("frame should be enqueued");
+        let id = match frame.id() {
+            Id::Standard(id) => id.as_raw() as u32,
+            Id::Extended(id) => id.as_raw(),
+        };
+        assert_eq!(id, 0x321);
+        assert_eq!(frame.data(), &[7u8]);
+    }
+}
