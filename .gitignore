@@ -1,4 +1,6 @@
 /target
 
 # Environment variables
+venv
+
 .env

@@ -21,3 +21,6 @@ check_timing:
 
 remove_unused_features:
     cargo features prune
+
+test_heartbeat:
+    python ./python_test/heartbeat_mqtt.py --host 192.168.0.203 --port 1884 --verbose 
