@@ -459,6 +459,41 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_roundtrip_big_endian() {
+        let signal = build_signal(
+            "Speed",
+            0,
+            16,
+            ByteOrder::BigEndian,
+            MultiplexIndicator::Plain,
+            0.1,
+            0.0,
+        );
+
+        let expected_value = 45.6_f32;
+        let mut encoder = MessageData::new("Msg".into(), vec![signal.clone()], 2, false);
+        encoder
+            .set_signal_value("Speed", expected_value)
+            .expect("signal exists");
+
+        let frame = encoder.construct_frame(0x123).expect("frame created");
+
+        let mut decoder = MessageData::new("Msg".into(), vec![signal], 2, false);
+        let changes = decoder.update_from_frame(&frame);
+
+        let decoded = decoder.get_signal_value("Speed").unwrap();
+        assert!(
+            (decoded - expected_value).abs() < 0.001,
+            "expected {expected_value}, got {decoded}"
+        );
+        assert_eq!(
+            changes,
+            vec![("Speed".to_string(), decoded)],
+            "expected change was reported"
+        );
+    }
+
+    #[test]
     fn multiplexed_signal_respects_mux_value() {
         let mux_signal = build_signal(
             "Mux",

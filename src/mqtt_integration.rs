@@ -451,7 +451,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payload_with_empty_message_or_signal_is_rejected() {
+    async fn payload_with_non_finite_control_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": 1e100 })),
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("non-finite control should error");
+        assert!(
+            err.to_string().contains("must be finite"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_empty_message_is_rejected() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let bus = build_bus(tx);
 
@@ -467,6 +487,12 @@ mod tests {
             err.to_string().contains("non-empty message and signal"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn payload_with_empty_signal_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
 
         let empty_signal = SignalUpdatePayload {
             control_id: None,
@@ -480,5 +506,24 @@ mod tests {
             err.to_string().contains("non-empty message and signal"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn payload_with_single_control_entry_is_accepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": 3 })),
+            control_requested_time_utc: None,
+        };
+
+        handle_payload(bus, payload)
+            .await
+            .expect("single control entry should be accepted");
+
+        let frame = rx.try_recv().expect("frame should be enqueued");
+        assert_eq!(frame.data(), &[3u8]);
     }
 }
