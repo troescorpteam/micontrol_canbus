@@ -244,8 +244,11 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
                     .or_else(|| val.as_i64().map(|v| v as f64))
                     .ok_or_else(|| anyhow::anyhow!("Control value must be numeric"))?;
                 let value = value as f32;
+                if value.is_nan() {
+                    return Err(anyhow::anyhow!("Control value must not be NaN"));
+                }
                 if !value.is_finite() {
-                    return Err(anyhow::anyhow!("Control value must be finite"));
+                    return Err(anyhow::anyhow!("Control value must be finite (not infinity)"));
                 }
                 Ok((key.clone(), value))
             })
