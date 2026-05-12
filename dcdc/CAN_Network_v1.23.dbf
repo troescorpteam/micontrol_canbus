@@ -1,0 +1,234 @@
+//******************************BUSMASTER Messages and signals Database ******************************//
+
+[DATABASE_VERSION] 1.3
+
+[PROTOCOL] CAN
+
+[BUSMASTER_VERSION] [3.2.2]
+[NUMBER_OF_MESSAGES] 18
+
+[START_MSG] EPC_control,60160,5,4,1,X,
+[START_SIGNALS] Enable,1,1,0,B,1,0,1,0,1,,,
+[START_SIGNALS] Power_direction,1,1,1,B,1,0,1,0,1,,,
+[START_SIGNALS] Current_ref_HS,16,2,0,I,200,-200,1,0,0.1,,,
+[START_SIGNALS] Current_ref_LS,16,4,0,I,200,-200,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_config,60161,8,7,1,X,
+[START_SIGNALS] Mode,2,1,0,U,3,0,1,0,1,,,
+[START_SIGNALS] HS_max_voltage,10,1,2,U,1000,0,1,0,1,,,
+[START_SIGNALS] HS_min_voltage,10,2,4,U,1000,0,1,0,1,,,
+[START_SIGNALS] LS_max_voltage,10,3,6,U,1000,0,1,0,0.1,,,
+[START_SIGNALS] LS_min_voltage,10,5,0,U,1000,0,1,0,0.1,,,
+[START_SIGNALS] Charge_power_limit,10,6,2,U,1000,0,1,0,10,,,
+[START_SIGNALS] Discharge_power_limit,10,7,4,U,1000,0,1,0,10,,,
+[END_MSG]
+
+[START_MSG] EPC_meas_config,60162,3,2,1,X,
+[START_SIGNALS] Enable_FB01_FB02_msg,1,1,0,B,1,0,1,0,1,,,
+[START_SIGNALS] FB01_FB02_msg_period,16,2,0,U,1000,50,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_ext_config,60163,2,3,1,X,
+[START_SIGNALS] Extended_mode,6,1,0,U,7,0,1,0,1,,,
+[START_SIGNALS] Power_flow_direction,2,1,6,U,2,0,1,0,1,,,
+[START_SIGNALS] CAN_net_check_mode,4,2,0,U,3,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_currents_lims_config,60164,8,4,1,X,
+[START_SIGNALS] HVDC_charge_current_lim,16,1,0,U,65535,0,1,0,0.01,,,
+[START_SIGNALS] HVDC_discharge_current_lim,16,3,0,U,65535,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_charge_current_lim,16,5,0,U,65535,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_discharge_current_lim,16,7,0,U,65535,0,1,0,0.1,,,
+[END_MSG]
+
+[START_MSG] EPC_HSVCMode_control,60165,8,5,1,X,
+[START_SIGNALS] HS_voltage_ref,16,1,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_max_voltage,16,3,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_min_voltage,16,5,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_max_volt_hysteresis,8,7,0,U,255,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_min_volt_hysteresis,8,8,0,U,255,0,1,0,0.1,,,
+[END_MSG]
+
+[START_MSG] EPC_LSVCMode_control,60166,8,5,1,X,
+[START_SIGNALS] LS_voltage_reference,16,1,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] HVDC_max_voltage,16,3,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] HVDC_min_voltage,16,5,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] HVDC_max_volt_hysteresis,8,7,0,U,255,0,1,0,1,,,
+[START_SIGNALS] HVDC_min_volt_hysteresis,8,8,0,U,255,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_info_request,61198,1,1,1,X,
+[START_SIGNALS] EPC_info_request,6,1,0,U,63,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_status,64256,6,6,1,X,
+[START_SIGNALS] VVVF_status_AMode,2,1,0,U,3,0,1,0,1,,,
+[START_SIGNALS] enable_HW_enable_echo,1,1,2,B,1,0,1,0,1,,,
+[START_SIGNALS] safety_disconnection_HW_echo,1,1,3,B,1,0,1,0,1,,,
+[START_SIGNALS] warning_codes,8,3,0,U,255,0,1,0,1,,,
+[START_SIGNALS] error_codes,8,4,0,U,255,0,1,0,1,,,
+[START_SIGNALS] error_values,16,5,0,I,32767,-32768,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_measurements_1,64257,8,4,1,X,
+[START_SIGNALS] LVDC_link_voltage,16,1,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_link_avg_current,16,3,0,I,2550,-2560,1,0,0.1,,,
+[START_SIGNALS] LVDC_link_avg_power,16,5,0,I,32767,-32768,1,0,1,,,
+[START_SIGNALS] HVDC_link_voltage,16,7,0,U,1000,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_measurements_2,64258,4,4,1,X,
+[START_SIGNALS] HVDC_link_avg_current,8,1,0,I,127,-128,1,0,0.1,,,
+[START_SIGNALS] out_current_load_4A4B,8,2,0,U,255,0,1,0,0.1,,,
+[START_SIGNALS] in_current_charger_4C4D,8,3,0,U,255,0,1,0,0.1,,,
+[START_SIGNALS] in_current_solar_charger_4E4F,8,4,0,U,255,0,1,0,0.1,,,
+[END_MSG]
+
+[START_MSG] EPC_config_ans,64259,8,7,1,X,
+[START_SIGNALS] Mode_ans,2,1,0,U,3,0,1,0,1,,,
+[START_SIGNALS] HS_max_voltage_ans,10,1,2,U,1000,0,1,0,1,,,
+[START_SIGNALS] HS_min_voltage_ans,10,2,4,U,1000,0,1,0,1,,,
+[START_SIGNALS] LS_max_voltage_ans,10,3,6,U,1000,0,1,0,0.1,,,
+[START_SIGNALS] LS_min_voltage_ans,10,5,0,U,1000,0,1,0,0.1,,,
+[START_SIGNALS] Charge_power_limit_ans,10,6,2,U,1000,0,1,0,10,,,
+[START_SIGNALS] Discharge_power_limit_ans,10,7,4,U,1000,0,1,0,10,,,
+[END_MSG]
+
+[START_MSG] EPC_control_ans,64260,5,4,1,X,
+[START_SIGNALS] Enable_ans,1,1,0,B,1,0,1,0,1,,,
+[START_SIGNALS] Power_direction_ans,1,1,1,B,1,0,1,0,1,,,
+[START_SIGNALS] Current_ref_HS_ans,16,2,0,I,200,-200,1,0,0.1,,,
+[START_SIGNALS] Current_ref_LS_ans,16,4,0,I,200,-200,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_ext_config_ans,64261,2,3,1,X,
+[START_SIGNALS] Extended_mode_ans,6,1,0,U,7,0,1,0,1,,,
+[START_SIGNALS] Power_flow_direction_ans,2,1,6,U,2,0,1,0,1,,,
+[START_SIGNALS] CAN_net_check_ans,4,2,0,U,3,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_currents_lims_config_ans,64262,8,4,1,X,
+[START_SIGNALS] HVDC_charge_current_lim_ans,16,1,0,U,65535,0,1,0,0.01,,,
+[START_SIGNALS] HVDC_discharge_current_lim_ans,16,3,0,U,65535,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_charge_current_lim_ans,16,5,0,U,65535,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_discharge_current_lim_ans,16,7,0,U,65535,0,1,0,0.1,,,
+[END_MSG]
+
+[START_MSG] EPC_HSVCMode_control_ans,64263,8,5,1,X,
+[START_SIGNALS] HVDC_voltage_ref_ans,16,1,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_max_voltage_ans,16,3,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_min_voltage_ans,16,5,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] LVDC_max_volt_hysteresis_ans,8,7,0,U,255,0,1,0,0.1,,,
+[START_SIGNALS] LVDC_min_volt_hysteresis_ans,8,8,0,U,255,0,1,0,0.1,,,
+[END_MSG]
+
+[START_MSG] EPC_LVSCMode_control_ans,64264,8,5,1,X,
+[START_SIGNALS] LVDC_voltage_ref_ans,16,1,0,U,20000,0,1,0,0.01,,,
+[START_SIGNALS] HVDC_max_voltage_ans,16,3,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] HVDC_min_voltage_ans,16,5,0,U,10000,0,1,0,0.1,,,
+[START_SIGNALS] HVDC_max_volt_hysteresis_ans,8,7,0,U,255,0,1,0,1,,,
+[START_SIGNALS] HVDC_min_volt_hysteresis_ans,8,8,0,U,255,0,1,0,1,,,
+[END_MSG]
+
+[START_MSG] EPC_info_ans,65294,8,3,1,X,
+[START_SIGNALS] EPC_type_ans,8,1,0,U,255,0,1,0,1,,,
+[START_SIGNALS] Firmware_version,20,2,4,U,1048575,0,1,0,1,,,
+[START_SIGNALS] Serial_Number,32,5,0,U,4294967295,0,1,0,1,,,
+[END_MSG]
+
+[START_SIG_LIST]
+[START_SIGNALS] Power,8,1,0,U,255,0,1,0,1,,,
+[END_SIG_LIST]
+
+[START_VALUE_TABLE]
+[END_VALUE_TABLE]
+
+[NODE] 
+
+[START_DESC]
+[START_DESC_NET]
+[END_DESC_NET]
+
+[START_DESC_NODE]
+[END_DESC_NODE]
+
+[START_DESC_MSG]
+1073741824 X "This is a message for not used signals, created by Vector CANdb++ DBC OLE DB Provider.";
+[END_DESC_MSG]
+
+[START_DESC_SIG]
+[END_DESC_SIG]
+[END_DESC]
+
+[START_PARAM]
+[START_PARAM_NET]
+"BusType",STRING,"CAN"
+[END_PARAM_NET]
+
+[START_PARAM_NODE]
+[END_PARAM_NODE]
+
+[START_PARAM_MSG]
+[END_PARAM_MSG]
+
+[START_PARAM_SIG]
+[END_PARAM_SIG]
+
+[START_PARAM_NODE_RX_SIG]
+[END_PARAM_NODE_RX_SIG]
+
+[START_PARAM_NODE_TX_MSG]
+[END_PARAM_NODE_TX_MSG]
+[END_PARAM]
+
+[START_PARAM_VAL]
+[START_PARAM_NET_VAL]
+[END_PARAM_NET_VAL]
+
+[START_PARAM_NODE_VAL]
+[END_PARAM_NODE_VAL]
+
+[START_PARAM_MSG_VAL]
+[END_PARAM_MSG_VAL]
+
+[START_PARAM_SIG_VAL]
+[END_PARAM_SIG_VAL]
+
+[END_PARAM_VAL]
+
+
+[START_NOT_SUPPORTED]
+[END_NOT_SUPPORTED]
+
+[START_NOT_PROCESSED]
+	PZ_
+	ON_QRS_
+	ON_
+	INY_
+	PNG_QRS_
+	PNG_
+	SVYGRE
+	ON_QRS_QRS_
+	RI_QNGN_
+	RAIINE_QNGN_
+	FTGLCR_
+	FTGLCR_INY_
+	ON_QRS_FTGLCR_
+	ON_FTGLCR_
+	FVT_GLCR_ERS_
+	INY_GNOYR_
+	FVT_TEBHC_
+	FVT_INYGLCR_
+	FVTGLCR_INYGLCR_
+	OB_GK_OH_
+	ON_QRS_ERY_
+	ON_ERY_
+	ON_QRS_QRS_ERY_
+	OH_FT_ERY_
+	OH_RI_ERY_
+	OH_OB_ERY_
+	FT_ZHY_INY_
+OF_:
+
+[END_NOT_PROCESSED]

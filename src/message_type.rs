@@ -397,6 +397,9 @@ fn sign_extend(value: u64, bits: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use can_dbc::{Dbc, MessageId};
+
+    const DCDC_DBC: &str = include_str!("../dcdc.dbc");
 
     fn build_signal(
         name: &str,
@@ -421,6 +424,73 @@ mod tests {
             unit: "".to_string(),
             receivers: vec![],
         }
+    }
+
+    fn dcdc_message(name: &str) -> (u32, MessageData) {
+        let dbc = Dbc::try_from(DCDC_DBC).expect("DCDC DBC should parse");
+        let message = dbc
+            .messages
+            .iter()
+            .find(|message| message.name == name)
+            .unwrap_or_else(|| panic!("message '{name}' should exist in DCDC DBC"));
+
+        let raw_id = match message.id {
+            MessageId::Standard(id) => id.into(),
+            MessageId::Extended(id) => id,
+        };
+        let id = raw_id & !EFF_FLAG;
+        let data = MessageData::new(
+            message.name.clone(),
+            message.signals.clone(),
+            message.size as u8,
+            matches!(message.id, MessageId::Extended(_)),
+        );
+
+        (id, data)
+    }
+
+    fn assert_dcdc_frame(
+        message_name: &str,
+        signal_values: &[(&str, f32)],
+        expected_id: u32,
+        expected_data: &[u8],
+    ) {
+        let (id, mut message) = dcdc_message(message_name);
+        assert_eq!(id, expected_id, "unexpected CAN ID for {message_name}");
+
+        for (signal, value) in signal_values {
+            message
+                .set_signal_value(signal, *value)
+                .unwrap_or_else(|err| panic!("failed to set {message_name}.{signal}: {err}"));
+        }
+
+        let frame = message
+            .construct_frame(id)
+            .unwrap_or_else(|err| panic!("failed to construct {message_name}: {err}"));
+
+        let actual_id = match frame.id() {
+            Id::Standard(id) => id.as_raw() as u32,
+            Id::Extended(id) => id.as_raw(),
+        };
+
+        assert_eq!(
+            actual_id, expected_id,
+            "unexpected frame ID for {message_name}"
+        );
+        assert!(
+            matches!(frame.id(), Id::Extended(_)),
+            "{message_name} should use an extended CAN ID"
+        );
+        assert_eq!(
+            frame.data().len(),
+            expected_data.len(),
+            "unexpected DLC for {message_name}"
+        );
+        assert_eq!(
+            frame.data(),
+            expected_data,
+            "unexpected raw bytes for {message_name}"
+        );
     }
 
     #[test]
@@ -568,5 +638,88 @@ mod tests {
             changes.iter().all(|(name, _)| name != "SignalB"),
             "SignalB should not be reported as changed"
         );
+    }
+
+    #[test]
+    fn dcdc_startup_frames_match_busmaster_config_bytes() {
+        let cases: &[(&str, &[(&str, f32)], u32, &[u8])] = &[
+            (
+                "EPC_meas_config",
+                &[
+                    ("Enable_FB01_FB02_msg", 1.0),
+                    ("FB01_FB02_msg_period", 50.0),
+                ],
+                0xEB02,
+                &[0x01, 0x32, 0x00],
+            ),
+            (
+                "EPC_control",
+                &[
+                    ("Enable", 0.0),
+                    ("Power_direction", 0.0),
+                    ("Current_ref_HS", 0.0),
+                    ("Current_ref_LS", 0.0),
+                ],
+                0xEB00,
+                &[0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                "EPC_LSVCMode_control",
+                &[
+                    ("LS_voltage_reference", 48.0),
+                    ("HVDC_max_voltage", 700.0),
+                    ("HVDC_min_voltage", 535.0),
+                    ("HVDC_max_volt_hysteresis", 5.0),
+                    ("HVDC_min_volt_hysteresis", 5.0),
+                ],
+                0xEB06,
+                &[0xC0, 0x12, 0x58, 0x1B, 0xE6, 0x14, 0x05, 0x05],
+            ),
+            (
+                "EPC_ext_config",
+                &[
+                    ("Extended_mode", 2.0),
+                    ("Power_flow_direction", 1.0),
+                    ("CAN_net_check_mode", 0.0),
+                ],
+                0xEB03,
+                &[0x42, 0x00],
+            ),
+            (
+                "EPC_currents_lims_config",
+                &[
+                    ("HVDC_charge_current_lim", 120.0),
+                    ("HVDC_discharge_current_lim", 120.0),
+                    ("LVDC_charge_current_lim", 120.0),
+                    ("LVDC_discharge_current_lim", 120.0),
+                ],
+                0xEB04,
+                &[0xE0, 0x2E, 0xE0, 0x2E, 0xB0, 0x04, 0xB0, 0x04],
+            ),
+            (
+                "EPC_config",
+                &[
+                    ("Mode", 3.0),
+                    ("HS_max_voltage", 700.0),
+                    ("HS_min_voltage", 530.0),
+                    ("LS_max_voltage", 55.0),
+                    ("LS_min_voltage", 0.0),
+                    ("Charge_power_limit", 5500.0),
+                    ("Discharge_power_limit", 10.0),
+                ],
+                0xEB01,
+                &[0xF3, 0x2A, 0xA1, 0x89, 0x00, 0x98, 0x18, 0x00],
+            ),
+            (
+                "EPC_info_request",
+                &[("EPC_info_request", 0.0)],
+                0xEF0E,
+                &[0x00],
+            ),
+        ];
+
+        for (message_name, signal_values, expected_id, expected_data) in cases {
+            assert_dcdc_frame(message_name, signal_values, *expected_id, expected_data);
+        }
     }
 }

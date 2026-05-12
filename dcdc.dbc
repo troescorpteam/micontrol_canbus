@@ -1,0 +1,159 @@
+VERSION ""
+
+
+NS_ : 
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_:
+
+
+BO_ 3221225472 VECTOR__INDEPENDENT_SIG_MSG: 0 Vector__XXX
+ SG_ Power : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 2147543808 EPC_control: 5 Vector__XXX
+ SG_ Enable : 0|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ Power_direction : 1|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ Current_ref_HS : 8|16@1- (0.1,0) [-20|20] "" Vector__XXX
+ SG_ Current_ref_LS : 24|16@1- (1,0) [-200|200] "" Vector__XXX
+
+BO_ 2147543809 EPC_config: 8 Vector__XXX
+ SG_ Mode : 0|2@1+ (1,0) [0|3] "" Vector__XXX
+ SG_ HS_max_voltage : 2|10@1+ (1,0) [0|1000] "" Vector__XXX
+ SG_ HS_min_voltage : 12|10@1+ (1,0) [0|1000] "" Vector__XXX
+ SG_ LS_max_voltage : 22|10@1+ (0.1,0) [0|100] "" Vector__XXX
+ SG_ LS_min_voltage : 32|10@1+ (0.1,0) [0|100] "" Vector__XXX
+ SG_ Charge_power_limit : 42|10@1+ (10,0) [0|10000] "" Vector__XXX
+ SG_ Discharge_power_limit : 52|10@1+ (10,0) [0|10000] "" Vector__XXX
+
+BO_ 2147543810 EPC_meas_config: 3 Vector__XXX
+ SG_ Enable_FB01_FB02_msg : 0|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ FB01_FB02_msg_period : 8|16@1+ (1,0) [50|1000] "" Vector__XXX
+
+BO_ 2147543811 EPC_ext_config: 2 Vector__XXX
+ SG_ Extended_mode : 0|6@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ Power_flow_direction : 6|2@1+ (1,0) [0|2] "" Vector__XXX
+ SG_ CAN_net_check_mode : 8|4@1+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2147543812 EPC_currents_lims_config: 8 Vector__XXX
+ SG_ HVDC_charge_current_lim : 0|16@1+ (0.01,0) [0|655.35] "" Vector__XXX
+ SG_ HVDC_discharge_current_lim : 16|16@1+ (0.01,0) [0|655.35] "" Vector__XXX
+ SG_ LVDC_charge_current_lim : 32|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+ SG_ LVDC_discharge_current_lim : 48|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+
+BO_ 2147543813 EPC_HSVCMode_control: 8 Vector__XXX
+ SG_ HS_voltage_ref : 0|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ LVDC_max_voltage : 16|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ LVDC_min_voltage : 32|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ LVDC_max_volt_hysteresis : 48|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+ SG_ LVDC_min_volt_hysteresis : 56|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+
+BO_ 2147543814 EPC_LSVCMode_control: 8 Vector__XXX
+ SG_ LS_voltage_reference : 0|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ HVDC_max_voltage : 16|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ HVDC_min_voltage : 32|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ HVDC_max_volt_hysteresis : 48|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ HVDC_min_volt_hysteresis : 56|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 2147544846 EPC_info_request: 1 Vector__XXX
+ SG_ EPC_info_request : 0|6@1+ (1,0) [0|63] "" Vector__XXX
+
+BO_ 2147547904 EPC_status: 6 Vector__XXX
+ SG_ VVVF_status_AMode : 0|2@1+ (1,0) [0|3] "" Vector__XXX
+ SG_ enable_HW_enable_echo : 2|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ safety_disconnection_HW_echo : 3|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ warning_codes : 16|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ error_codes : 24|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ error_values : 32|16@1- (1,0) [-32768|32767] "" Vector__XXX
+
+BO_ 2147547905 EPC_measurements_1: 8 Vector__XXX
+ SG_ LVDC_link_voltage : 0|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ LVDC_link_avg_current : 16|16@1- (0.1,0) [-256|255] "" Vector__XXX
+ SG_ LVDC_link_avg_power : 32|16@1- (1,0) [-32768|32767] "" Vector__XXX
+ SG_ HVDC_link_voltage : 48|16@1+ (1,0) [0|1000] "" Vector__XXX
+
+BO_ 2147547906 EPC_measurements_2: 4 Vector__XXX
+ SG_ HVDC_link_avg_current : 0|8@1- (0.1,0) [-12.8|12.7] "" Vector__XXX
+ SG_ out_current_load_4A4B : 8|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+ SG_ in_current_charger_4C4D : 16|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+ SG_ in_current_solar_charger_4E4F : 24|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+
+BO_ 2147547907 EPC_config_ans: 8 Vector__XXX
+ SG_ Mode_ans : 0|2@1+ (1,0) [0|3] "" Vector__XXX
+ SG_ HS_max_voltage_ans : 2|10@1+ (1,0) [0|1000] "" Vector__XXX
+ SG_ HS_min_voltage_ans : 12|10@1+ (1,0) [0|1000] "" Vector__XXX
+ SG_ LS_max_voltage_ans : 22|10@1+ (0.1,0) [0|100] "" Vector__XXX
+ SG_ LS_min_voltage_ans : 32|10@1+ (0.1,0) [0|100] "" Vector__XXX
+ SG_ Charge_power_limit_ans : 42|10@1+ (10,0) [0|10000] "" Vector__XXX
+ SG_ Discharge_power_limit_ans : 52|10@1+ (10,0) [0|10000] "" Vector__XXX
+
+BO_ 2147547908 EPC_control_ans: 5 Vector__XXX
+ SG_ Enable_ans : 0|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ Power_direction_ans : 1|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ Current_ref_HS_ans : 8|16@1- (0.1,0) [-20|20] "" Vector__XXX
+ SG_ Current_ref_LS_ans : 24|16@1- (1,0) [-200|200] "" Vector__XXX
+
+BO_ 2147547909 EPC_ext_config_ans: 2 Vector__XXX
+ SG_ Extended_mode_ans : 0|6@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ Power_flow_direction_ans : 6|2@1+ (1,0) [0|2] "" Vector__XXX
+ SG_ CAN_net_check_ans : 8|4@1+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2147547910 EPC_currents_lims_config_ans: 8 Vector__XXX
+ SG_ HVDC_charge_current_lim_ans : 0|16@1+ (0.01,0) [0|655.35] "" Vector__XXX
+ SG_ HVDC_discharge_current_lim_ans : 16|16@1+ (0.01,0) [0|655.35] "" Vector__XXX
+ SG_ LVDC_charge_current_lim_ans : 32|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+ SG_ LVDC_discharge_current_lim_ans : 48|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+
+BO_ 2147547911 EPC_HSVCMode_control_ans: 8 Vector__XXX
+ SG_ HVDC_voltage_ref_ans : 0|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ LVDC_max_voltage_ans : 16|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ LVDC_min_voltage_ans : 32|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ LVDC_max_volt_hysteresis_ans : 48|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+ SG_ LVDC_min_volt_hysteresis_ans : 56|8@1+ (0.1,0) [0|25.5] "" Vector__XXX
+
+BO_ 2147547912 EPC_LVSCMode_control_ans: 8 Vector__XXX
+ SG_ LVDC_voltage_ref_ans : 0|16@1+ (0.01,0) [0|200] "" Vector__XXX
+ SG_ HVDC_max_voltage_ans : 16|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ HVDC_min_voltage_ans : 32|16@1+ (0.1,0) [0|1000] "" Vector__XXX
+ SG_ HVDC_max_volt_hysteresis_ans : 48|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ HVDC_min_volt_hysteresis_ans : 56|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 2147548942 EPC_info_ans: 8 Vector__XXX
+ SG_ EPC_type_ans : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ Firmware_version : 12|20@1+ (1,0) [0|1048575] "" Vector__XXX
+ SG_ Serial_Number : 32|32@1+ (1,0) [0|4294967295] "" Vector__XXX
+
+
+
+CM_ BO_ 3221225472 "This is a message for not used signals, created by Vector CANdb++ DBC OLE DB Provider.";
+BA_DEF_  "BusType" STRING ;
+BA_DEF_DEF_  "BusType" "CAN";
+
