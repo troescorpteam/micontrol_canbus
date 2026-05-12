@@ -72,12 +72,14 @@ Notes:
 | `SYSTEM_NAME` | `micontrol` | Prefix used to derive MQTT topics |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `MQTT_HOST` | `localhost` | MQTT broker host |
-| `MQTT_PORT` | `1884` | MQTT broker port |
+| `MQTT_PORT` | `1884` | MQTT broker port (code default; set to your broker port, commonly `1883`/`8883`) |
 | `MQTT_USERNAME` | `iot_platform` | MQTT username |
 | `MQTT_PASSWORD` | `123456` | MQTT password |
 | `RUST_LOG` | `micontrol_canbus=info` (via fallback filter) | Logging level/filter |
 
 Use `.env.example` as a starting point and create a local `.env`.
+
+Security note: default MQTT credentials are development defaults from the codebase; always override them with strong credentials in production.
 
 ## MQTT contract
 
@@ -187,4 +189,3 @@ Using Cargo locally:
 - Periodic (10s) CAN activity summaries include last frame metadata.
 - First frame on each interface is explicitly logged.
 - MQTT reconnect logic uses exponential backoff.
-
