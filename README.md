@@ -79,9 +79,10 @@ Notes:
 
 Use `.env.example` as a starting point and create a local `.env`.
 
-Note: `1884` is the current application default in code and may reflect a project-specific broker setup; set `MQTT_PORT` explicitly for your environment (`1883`/`8883` are common standard ports).
+Note: `1884` is the current application default in code for this project; treat it as deployment-specific and set `MQTT_PORT` explicitly for your environment (`1883`/`8883` are common standard ports).
 
 ⚠️ WARNING: the documented default MQTT credentials (`iot_platform` / `123456`) are insecure development defaults and must never be used in production.
+Use environment-specific secret injection (for example, CI/CD secrets, container/orchestrator secret stores, or OS-level secret management) instead of hardcoded credentials.
 
 ## MQTT contract
 
@@ -185,6 +186,8 @@ Using Cargo locally:
   - Scans bus IDs for a time window and reports missing expected IDs.
 - `reset_can_interface.sh`
   - Brings interface down/up with bitrate configuration.
+
+Note: despite the folder name, `python_test/` contains both Python utilities and a shell helper script.
 
 ## Logging and observability
 
