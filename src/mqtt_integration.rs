@@ -13,12 +13,6 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalUpdatePayload {
     #[serde(default)]
-    pub message_name: Option<String>,
-    #[serde(default)]
-    pub signal_name: Option<String>,
-    #[serde(default)]
-    pub new_value: Option<String>,
-    #[serde(default)]
     pub control_id: Option<String>,
     #[serde(default)]
     pub control: Option<serde_json::Value>,
@@ -232,31 +226,13 @@ async fn process_can_signal_update(
 }
 
 async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Result<()> {
-    if let (Some(message_name), Some(signal_name), Some(new_value)) =
-        (payload.message_name, payload.signal_name, payload.new_value)
-    {
-        info!(
-            bus = %bus.controller(),
-            message_name = %message_name,
-            signal_name = %signal_name,
-            new_value = %new_value,
-            "Parsed legacy MQTT payload"
-        );
-
-        let value = new_value
-            .parse::<f32>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse new_value '{new_value}': {e}"))?;
-
-        return process_can_signal_update(bus, &message_name, &signal_name, value).await;
-    }
-
     if let Some(control) = payload.control {
         let control_map = control
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Expected 'control' to be a JSON object"))?;
 
-        if control_map.is_empty() {
-            anyhow::bail!("'control' object was empty");
+        if control_map.len() != 1 {
+            anyhow::bail!("'control' object must contain exactly one entry");
         }
 
         let (message_signal, value) = control_map
@@ -266,9 +242,17 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
                 let value = val
                     .as_f64()
                     .or_else(|| val.as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                (key.clone(), value as f32)
+                    .ok_or_else(|| anyhow::anyhow!("Control value must be numeric"))?;
+                let value = value as f32;
+                if value.is_nan() {
+                    return Err(anyhow::anyhow!("Control value must not be NaN"));
+                }
+                if !value.is_finite() {
+                    return Err(anyhow::anyhow!("Control value must be finite (not infinity)"));
+                }
+                Ok((key.clone(), value))
             })
+            .transpose()?
             .ok_or_else(|| anyhow::anyhow!("Failed to extract control payload"))?;
 
         let mut parts = message_signal.splitn(2, '.');
@@ -280,6 +264,9 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
         let signal = parts.next().ok_or_else(|| {
             anyhow::anyhow!("Control key missing signal suffix (expected 'MessageName.SignalName')")
         })?;
+        if message.is_empty() || signal.is_empty() {
+            anyhow::bail!("Control key must include non-empty message and signal names");
+        }
 
         info!(
             bus = %bus.controller(),
@@ -293,5 +280,250 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
         return process_can_signal_update(bus, message, signal, value).await;
     }
 
-    anyhow::bail!("Unsupported MQTT payload format")
+    anyhow::bail!("Missing required 'control' object in MQTT payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_type::MessageData;
+    use can_dbc::{ByteOrder, MultiplexIndicator, Signal, ValueType};
+    use dashmap::DashMap;
+    use serde_json::json;
+    use socketcan::CanFrame;
+    use socketcan::Id;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    fn build_signal(
+        name: &str,
+        start_bit: u64,
+        size: u64,
+        byte_order: ByteOrder,
+    ) -> Signal {
+        Signal {
+            name: name.to_string(),
+            multiplexer_indicator: MultiplexIndicator::Plain,
+            start_bit,
+            size,
+            byte_order,
+            value_type: ValueType::Unsigned,
+            factor: 1.0,
+            offset: 0.0,
+            min: 0.0,
+            max: 0.0,
+            unit: "".to_string(),
+            receivers: vec![],
+        }
+    }
+
+    fn build_bus(tx: mpsc::UnboundedSender<CanFrame>) -> Arc<BusState> {
+        let signal = build_signal("Signal", 0, 8, ByteOrder::LittleEndian);
+        let message_id = 0x321;
+
+        let mut index = HashMap::new();
+        index.insert("Cmd".to_string(), message_id);
+
+        let mut map = DashMap::new();
+        map.insert(
+            message_id,
+            MessageData::new("Cmd".into(), vec![signal], 1, false),
+        );
+
+        Arc::new(BusState::new(
+            "bus1".into(),
+            "can0".into(),
+            "can0".into(),
+            "redis_hash".into(),
+            "controls".into(),
+            "measurements".into(),
+            None,
+            None,
+            Arc::new(map),
+            Arc::new(index),
+            tx,
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn control_payload_enqueues_can_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: Some("ctrl-1".into()),
+            control: Some(json!({ "Cmd.Signal": 7 })),
+            control_requested_time_utc: None,
+        };
+
+        handle_payload(bus.clone(), payload)
+            .await
+            .expect("payload should be handled");
+
+        let frame = rx.try_recv().expect("frame should be enqueued");
+        let id = match frame.id() {
+            Id::Standard(id) => id.as_raw() as u32,
+            Id::Extended(id) => id.as_raw(),
+        };
+        assert_eq!(id, 0x321);
+        assert_eq!(frame.data(), &[7u8]);
+    }
+
+    #[tokio::test]
+    async fn payload_without_control_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: None,
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("missing control should error");
+        assert!(
+            err.to_string().contains("Missing required 'control' object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_empty_control_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({})),
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("empty control should error");
+        assert!(
+            err.to_string().contains("must contain exactly one entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_multiple_controls_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": 7, "Cmd.Other": 2 })),
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("multiple controls should error");
+        assert!(
+            err.to_string().contains("must contain exactly one entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_non_numeric_control_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": "hi" })),
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("non-numeric control should error");
+        assert!(
+            err.to_string().contains("must be numeric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_non_finite_control_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": 1e100 })),
+            control_requested_time_utc: None,
+        };
+
+        let err = handle_payload(bus, payload)
+            .await
+            .expect_err("non-finite control should error");
+        assert!(
+            err.to_string().contains("must be finite"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_empty_message_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let empty_message = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ ".Signal": 1 })),
+            control_requested_time_utc: None,
+        };
+        let err = handle_payload(bus.clone(), empty_message)
+            .await
+            .expect_err("empty message should error");
+        assert!(
+            err.to_string().contains("non-empty message and signal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_empty_signal_is_rejected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let empty_signal = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.": 1 })),
+            control_requested_time_utc: None,
+        };
+        let err = handle_payload(bus, empty_signal)
+            .await
+            .expect_err("empty signal should error");
+        assert!(
+            err.to_string().contains("non-empty message and signal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_with_single_control_entry_is_accepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bus = build_bus(tx);
+
+        let payload = SignalUpdatePayload {
+            control_id: None,
+            control: Some(json!({ "Cmd.Signal": 3 })),
+            control_requested_time_utc: None,
+        };
+
+        handle_payload(bus, payload)
+            .await
+            .expect("single control entry should be accepted");
+
+        let frame = rx.try_recv().expect("frame should be enqueued");
+        assert_eq!(frame.data(), &[3u8]);
+    }
 }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bus::{BusManager, BusState, RedisCommand};
 use can_dbc::Dbc;
 use chrono::{DateTime, SecondsFormat, Utc};
+use dashmap::DashMap;
 use dotenv::dotenv;
 use futures::{StreamExt, future};
 use identifiers::derive_identifiers;
@@ -15,7 +16,7 @@ use std::env;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -135,7 +136,7 @@ async fn main() -> Result<()> {
         let dbc = load_dbc(&dbc_path).await?;
         let (message_store, message_index) = build_message_store(&dbc);
 
-        let message_data = Arc::new(RwLock::new(message_store));
+        let message_data = Arc::new(message_store);
         let message_index = Arc::new(message_index);
 
         let topic_info = derive_identifiers(
@@ -230,8 +231,8 @@ async fn load_dbc(path: &str) -> Result<Dbc> {
         .map_err(|err| anyhow::anyhow!("Failed to parse DBC file '{path}': {:?}", err))
 }
 
-fn build_message_store(dbc: &Dbc) -> (HashMap<u32, MessageData>, HashMap<String, u32>) {
-    let mut message_map = HashMap::new();
+fn build_message_store(dbc: &Dbc) -> (DashMap<u32, MessageData>, HashMap<String, u32>) {
+    let message_map = DashMap::new();
     let mut name_index = HashMap::new();
 
     for msg in &dbc.messages {
@@ -409,9 +410,8 @@ fn spawn_can_runtime(
                             let frame_bytes = frame.data().to_vec();
                             let now = Utc::now();
 
-                            let (message_name, changed_signals) = {
-                                let mut data_guard = message_data.write().await;
-                                if let Some(msg_data) = data_guard.get_mut(&id) {
+                            let (message_name, changed_signals) =
+                                if let Some(mut msg_data) = message_data.get_mut(&id) {
                                     let message_name = msg_data.name.clone();
                                     let changes = msg_data.update_from_frame(&frame);
                                     (Some(message_name), changes)
@@ -422,8 +422,7 @@ fn spawn_can_runtime(
                                         "Received frame for unknown CAN ID"
                                     );
                                     (None, Vec::new())
-                                }
-                            };
+                                };
 
                             if let Some(message_name) = message_name.as_ref() {
                                 let mut measurement_payload = Map::new();
