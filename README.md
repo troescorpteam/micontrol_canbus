@@ -79,7 +79,9 @@ Notes:
 
 Use `.env.example` as a starting point and create a local `.env`.
 
-Security note: default MQTT credentials are development defaults from the codebase; always override them with strong credentials in production.
+Note: `1884` is the current application default in code and may reflect a project-specific broker setup; set `MQTT_PORT` explicitly for your environment (`1883`/`8883` are common standard ports).
+
+⚠️ WARNING: the documented default MQTT credentials (`iot_platform` / `123456`) are insecure development defaults and must never be used in production.
 
 ## MQTT contract
 
@@ -164,6 +166,7 @@ Using Cargo locally:
 
 1. Configure CAN interface (example helper script):
    - `sudo ./python_test/reset_can_interface.sh`
+   - `sudo` is required because bringing network interfaces down/up needs elevated privileges.
 2. Configure environment:
    - `cp .env.example .env`
    - add MQTT and SYSTEM_NAME values as needed
