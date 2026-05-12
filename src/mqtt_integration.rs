@@ -248,7 +248,9 @@ async fn handle_payload(bus: Arc<BusState>, payload: SignalUpdatePayload) -> Res
                     return Err(anyhow::anyhow!("Control value must not be NaN"));
                 }
                 if !value.is_finite() {
-                    return Err(anyhow::anyhow!("Control value must be finite (not infinity)"));
+                    return Err(anyhow::anyhow!(
+                        "Control value must be finite (not infinity)"
+                    ));
                 }
                 Ok((key.clone(), value))
             })
@@ -290,17 +292,12 @@ mod tests {
     use can_dbc::{ByteOrder, MultiplexIndicator, Signal, ValueType};
     use dashmap::DashMap;
     use serde_json::json;
-    use socketcan::CanFrame;
     use socketcan::Id;
+    use socketcan::{CanFrame, EmbeddedFrame};
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
-    fn build_signal(
-        name: &str,
-        start_bit: u64,
-        size: u64,
-        byte_order: ByteOrder,
-    ) -> Signal {
+    fn build_signal(name: &str, start_bit: u64, size: u64, byte_order: ByteOrder) -> Signal {
         Signal {
             name: name.to_string(),
             multiplexer_indicator: MultiplexIndicator::Plain,
@@ -324,7 +321,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert("Cmd".to_string(), message_id);
 
-        let mut map = DashMap::new();
+        let map = DashMap::new();
         map.insert(
             message_id,
             MessageData::new("Cmd".into(), vec![signal], 1, false),
@@ -385,7 +382,8 @@ mod tests {
             .await
             .expect_err("missing control should error");
         assert!(
-            err.to_string().contains("Missing required 'control' object"),
+            err.to_string()
+                .contains("Missing required 'control' object"),
             "unexpected error: {err}"
         );
     }

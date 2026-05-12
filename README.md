@@ -63,7 +63,8 @@ Notes:
 - DBC resolution from `hardware_configurations`:
   - If an entry already ends with `.dbc`, it is used directly.
   - Otherwise `<entry>.dbc` is tried.
-- `protocol` and `auto_invalidation_interval` are parsed but not currently used in runtime logic.
+- `auto_invalidation_interval` is the number of seconds without inbound CAN frames before the bus is reported as stale. Missing or `0` values default to `30`.
+- `protocol` is parsed but not currently used in runtime logic.
 
 ### Environment variables
 
@@ -134,9 +135,23 @@ When Redis is available:
   - field: `MessageName.SignalName`
   - value: numeric signal value
 - Global hash `connections` stores per-bus connection state JSON:
-  - `connection_status` (`Connected`/`Disconnected`)
+  - `connection_status` (`WaitingForData`/`Connected`/`Stale`/`Disconnected`)
   - `last_updated`
-  - `last_online`
+  - `last_online` (only after a real inbound CAN frame has been seen)
+  - `last_frame_at`
+  - `frame_age_ms`
+  - `total_frames`
+  - `interface`
+  - `reason`
+
+CAN connection health is based on inbound data freshness:
+
+- `WaitingForData`: SocketCAN opened, but no inbound CAN frame has arrived yet.
+- `Connected`: inbound CAN data has arrived within `auto_invalidation_interval`.
+- `Stale`: the socket is still open, but inbound CAN data has not arrived within `auto_invalidation_interval`.
+- `Disconnected`: the socket failed, ended, or the runtime task stopped.
+
+Status transitions are also published as lightweight payloads on the bus measurement topic. Signal snapshots are not cleared when a bus becomes stale; consumers should treat values as last-known data and use connection health to decide whether they are fresh.
 
 Identifier derivation:
 
@@ -194,4 +209,5 @@ Note: despite the folder name, `python_test/` contains both Python utilities and
 - Structured logs via `tracing` / `tracing-subscriber`.
 - Periodic (10s) CAN activity summaries include last frame metadata.
 - First frame on each interface is explicitly logged.
+- CAN health updates distinguish open sockets from fresh inbound data and log stale-threshold state.
 - MQTT reconnect logic uses exponential backoff.

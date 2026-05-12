@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bus::{BusManager, BusState, RedisCommand};
 use can_dbc::Dbc;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use dashmap::DashMap;
 use dotenv::dotenv;
 use futures::{StreamExt, future};
@@ -28,6 +28,8 @@ mod mqtt_integration;
 
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 const CONNECTIONS_HASH: &str = "connections";
+const DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS: u64 = 30;
+const CAN_ACTIVITY_LOG_INTERVAL_SECS: u64 = 10;
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfig {
@@ -78,6 +80,10 @@ impl HardwareMapping {
                 None
             }
         })
+    }
+
+    fn stale_after_secs(&self) -> u64 {
+        normalize_auto_invalidation_interval(self.auto_invalidation_interval)
     }
 }
 
@@ -180,6 +186,7 @@ async fn main() -> Result<()> {
             bus_state,
             tx_receiver,
             interface,
+            mapping.stale_after_secs(),
             redis_manager.clone(),
             Arc::clone(&mqtt_service),
         );
@@ -256,29 +263,136 @@ fn build_message_store(dbc: &Dbc) -> (DashMap<u32, MessageData>, HashMap<String,
     (message_map, name_index)
 }
 
+fn normalize_auto_invalidation_interval(configured: Option<u64>) -> u64 {
+    configured
+        .filter(|interval| *interval > 0)
+        .unwrap_or(DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanHealthStatus {
+    WaitingForData,
+    Connected,
+    Stale,
+    Disconnected,
+}
+
+impl CanHealthStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForData => "WaitingForData",
+            Self::Connected => "Connected",
+            Self::Stale => "Stale",
+            Self::Disconnected => "Disconnected",
+        }
+    }
+}
+
+fn health_status_for_frame_age(
+    now: DateTime<Utc>,
+    last_frame_at: Option<DateTime<Utc>>,
+    stale_after: ChronoDuration,
+) -> CanHealthStatus {
+    match last_frame_at {
+        Some(timestamp) if now.signed_duration_since(timestamp) <= stale_after => {
+            CanHealthStatus::Connected
+        }
+        Some(_) => CanHealthStatus::Stale,
+        None => CanHealthStatus::WaitingForData,
+    }
+}
+
+fn frame_age_ms(now: DateTime<Utc>, last_frame_at: Option<DateTime<Utc>>) -> Option<i64> {
+    last_frame_at.map(|timestamp| {
+        now.signed_duration_since(timestamp)
+            .num_milliseconds()
+            .max(0)
+    })
+}
+
+struct ConnectionStatusSnapshot {
+    status: CanHealthStatus,
+    reason: &'static str,
+    now: DateTime<Utc>,
+    last_frame_at: Option<DateTime<Utc>>,
+    total_frames: u64,
+    interface: String,
+}
+
+fn connection_status_payload(snapshot: &ConnectionStatusSnapshot) -> JsonValue {
+    let mut payload = Map::new();
+    payload.insert("connection_status".into(), json!(snapshot.status.as_str()));
+    payload.insert("status".into(), json!(snapshot.status.as_str()));
+    payload.insert("reason".into(), json!(snapshot.reason));
+    payload.insert("interface".into(), json!(snapshot.interface));
+    payload.insert("total_frames".into(), json!(snapshot.total_frames));
+    payload.insert(
+        "last_updated".into(),
+        json!(snapshot.now.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+    );
+    payload.insert(
+        "fetched_time_utc".into(),
+        json!(snapshot.now.to_rfc3339_opts(SecondsFormat::Millis, true)),
+    );
+
+    if let Some(last_frame_at) = snapshot.last_frame_at {
+        let timestamp = last_frame_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        payload.insert("last_online".into(), json!(timestamp));
+        payload.insert("last_frame_at".into(), json!(timestamp));
+        payload.insert(
+            "frame_age_ms".into(),
+            json!(frame_age_ms(snapshot.now, snapshot.last_frame_at)),
+        );
+    } else {
+        payload.insert("last_frame_at".into(), JsonValue::Null);
+        payload.insert("frame_age_ms".into(), JsonValue::Null);
+    }
+
+    JsonValue::Object(payload)
+}
+
 async fn update_connection_status(
     manager: &ConnectionManager,
     bus: &BusState,
-    status: &str,
-    last_online: Option<DateTime<Utc>>,
+    snapshot: &ConnectionStatusSnapshot,
 ) -> Result<()> {
-    let now = Utc::now();
-    let last_online = last_online.unwrap_or(now);
-    let payload = json!({
-        "connection_status": status,
-        "last_updated": now.to_rfc3339_opts(SecondsFormat::Nanos, true),
-        "last_online": last_online.to_rfc3339_opts(SecondsFormat::Nanos, true),
-    });
+    let payload = connection_status_payload(snapshot);
 
     let mut conn = manager.clone();
     redis::cmd("HSET")
-        .arg("connections")
+        .arg(CONNECTIONS_HASH)
         .arg(bus.redis_hash())
         .arg(payload.to_string())
         .query_async::<()>(&mut conn)
         .await?;
 
     Ok(())
+}
+
+async fn publish_connection_status(
+    redis_manager: Option<&ConnectionManager>,
+    mqtt_service: &mqtt_integration::MqttService,
+    bus: &BusState,
+    snapshot: &ConnectionStatusSnapshot,
+    publish_redis: bool,
+    publish_mqtt: bool,
+) {
+    if publish_redis && let Some(manager) = redis_manager {
+        if let Err(err) = update_connection_status(manager, bus, snapshot).await {
+            warn!(
+                interface = %snapshot.interface,
+                status = snapshot.status.as_str(),
+                error = %err,
+                "Failed to publish connection status to Redis"
+            );
+        }
+    }
+
+    if publish_mqtt {
+        mqtt_service
+            .publish_measurement(bus.measurement_topic(), connection_status_payload(snapshot))
+            .await;
+    }
 }
 
 struct LastFrameSummary {
@@ -352,6 +466,7 @@ fn spawn_can_runtime(
     bus_state: Arc<BusState>,
     mut tx_receiver: mpsc::UnboundedReceiver<CanFrame>,
     interface: String,
+    stale_after_secs: u64,
     redis_manager: Option<ConnectionManager>,
     mqtt_service: Arc<mqtt_integration::MqttService>,
 ) {
@@ -359,41 +474,64 @@ fn spawn_can_runtime(
     let message_data = frame_store.data();
     let bus_state_handle = Arc::clone(&bus_state);
     tokio::spawn(async move {
+        let bus_state = bus_state_handle;
+        let stale_after = ChronoDuration::seconds(stale_after_secs as i64);
+        let mut last_frame_at: Option<DateTime<Utc>> = None;
+        let mut total_frames: u64 = 0;
+        let mut unknown_frames: u64 = 0;
+        let mut frames_since_log: u64 = 0;
+
         let mut socket = match CanSocket::open(&interface) {
             Ok(socket) => socket,
             Err(err) => {
                 error!(interface = %interface, error = %err, "Failed to open CAN interface");
+                let snapshot = ConnectionStatusSnapshot {
+                    status: CanHealthStatus::Disconnected,
+                    reason: "socket_open_failed",
+                    now: Utc::now(),
+                    last_frame_at,
+                    total_frames,
+                    interface: interface.clone(),
+                };
+                publish_connection_status(
+                    redis_manager.as_ref(),
+                    &mqtt_service,
+                    &bus_state,
+                    &snapshot,
+                    true,
+                    true,
+                )
+                .await;
                 return;
             }
         };
 
-        let bus_state = bus_state_handle;
-
-        let mut last_online: Option<DateTime<Utc>> = None;
-
-        if let Some(manager) = redis_manager.clone() {
-            if let Err(err) =
-                update_connection_status(&manager, &bus_state, "Connected", None).await
-            {
-                warn!(
-                    interface = %interface,
-                    error = %err,
-                    "Failed to publish initial connection status"
-                );
-            } else {
-                last_online = Some(Utc::now());
-            }
-        }
+        let initial_snapshot = ConnectionStatusSnapshot {
+            status: CanHealthStatus::WaitingForData,
+            reason: "socket_opened",
+            now: Utc::now(),
+            last_frame_at,
+            total_frames,
+            interface: interface.clone(),
+        };
+        publish_connection_status(
+            redis_manager.as_ref(),
+            &mqtt_service,
+            &bus_state,
+            &initial_snapshot,
+            true,
+            true,
+        )
+        .await;
+        let mut last_status = Some(initial_snapshot.status);
 
         let mut log_interval = time::interval_at(
-            Instant::now() + Duration::from_secs(10),
-            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(CAN_ACTIVITY_LOG_INTERVAL_SECS),
+            Duration::from_secs(CAN_ACTIVITY_LOG_INTERVAL_SECS),
         );
         log_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut last_frame_info: Option<LastFrameSummary> = None;
-        let mut frames_since_log: u64 = 0;
-        let mut total_frames: u64 = 0;
 
         loop {
             tokio::select! {
@@ -421,6 +559,7 @@ fn spawn_can_runtime(
                                         interface = %interface,
                                         "Received frame for unknown CAN ID"
                                     );
+                                    unknown_frames += 1;
                                     (None, Vec::new())
                                 };
 
@@ -460,7 +599,7 @@ fn spawn_can_runtime(
                             let first_frame = total_frames == 0;
                             total_frames += 1;
                             frames_since_log += 1;
-                            last_online = Some(now);
+                            last_frame_at = Some(now);
 
                             let summary = LastFrameSummary {
                                 timestamp: now,
@@ -490,6 +629,32 @@ fn spawn_can_runtime(
                                     );
                                 }
                             }
+
+                            let snapshot = ConnectionStatusSnapshot {
+                                status: CanHealthStatus::Connected,
+                                reason: if last_status == Some(CanHealthStatus::Stale) {
+                                    "can_data_recovered"
+                                } else if first_frame {
+                                    "first_can_frame"
+                                } else {
+                                    "can_frame_received"
+                                },
+                                now,
+                                last_frame_at,
+                                total_frames,
+                                interface: interface.clone(),
+                            };
+                            let status_changed = last_status != Some(snapshot.status);
+                            publish_connection_status(
+                                redis_manager.as_ref(),
+                                &mqtt_service,
+                                &bus_state,
+                                &snapshot,
+                                status_changed,
+                                status_changed,
+                            )
+                            .await;
+                            last_status = Some(snapshot.status);
                         }
                         Some(Err(err)) => {
                             warn!(interface = %interface, error = %err, "CAN socket error");
@@ -508,7 +673,6 @@ fn spawn_can_runtime(
                                 error!(interface = %interface, error = %err, "Failed to send CAN frame");
                             } else {
                                 debug!(interface = %interface, frame_data = ?data, "Sent CAN frame");
-                                last_online = Some(Utc::now());
                             }
                         }
                         None => {
@@ -518,6 +682,34 @@ fn spawn_can_runtime(
                     }
                 }
                 _ = log_interval.tick() => {
+                    let now = Utc::now();
+                    let status = health_status_for_frame_age(now, last_frame_at, stale_after);
+                    let status_changed = last_status != Some(status);
+                    let snapshot = ConnectionStatusSnapshot {
+                        status,
+                        reason: match (status, last_status) {
+                            (CanHealthStatus::Stale, Some(CanHealthStatus::Connected)) => "can_data_stale",
+                            (CanHealthStatus::Stale, _) => "can_data_still_stale",
+                            (CanHealthStatus::WaitingForData, _) => "waiting_for_first_can_frame",
+                            (CanHealthStatus::Connected, _) => "can_data_fresh",
+                            (CanHealthStatus::Disconnected, _) => "disconnected",
+                        },
+                        now,
+                        last_frame_at,
+                        total_frames,
+                        interface: interface.clone(),
+                    };
+                    publish_connection_status(
+                        redis_manager.as_ref(),
+                        &mqtt_service,
+                        &bus_state,
+                        &snapshot,
+                        true,
+                        status_changed,
+                    )
+                    .await;
+                    last_status = Some(status);
+
                     if frames_since_log > 0 {
                         if let Some(summary) = last_frame_info.as_ref() {
                             let id_str = format_frame_id(summary.raw_id, summary.is_extended);
@@ -527,8 +719,11 @@ fn spawn_can_runtime(
                             let timestamp = summary.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
                             info!(
                                 interface = %interface,
+                                health_status = status.as_str(),
+                                stale_after_secs = stale_after_secs,
                                 frames_in_interval = frames_since_log,
                                 total_frames = total_frames,
+                                unknown_frames = unknown_frames,
                                 last_frame_timestamp = %timestamp,
                                 last_frame_id = %id_str,
                                 last_frame_message = %message,
@@ -537,28 +732,14 @@ fn spawn_can_runtime(
                                 last_frame_data = %data,
                                 "CAN activity in the last 10s"
                             );
-
-                            if let Some(manager) = redis_manager.clone() {
-                                if let Err(err) = update_connection_status(
-                                    &manager,
-                                    &bus_state,
-                                    "Connected",
-                                    Some(summary.timestamp),
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        interface = %interface,
-                                        error = %err,
-                                        "Failed to refresh connection status"
-                                    );
-                                }
-                            }
                         } else {
                             info!(
                                 interface = %interface,
+                                health_status = status.as_str(),
+                                stale_after_secs = stale_after_secs,
                                 frames_in_interval = frames_since_log,
                                 total_frames = total_frames,
+                                unknown_frames = unknown_frames,
                                 "Received CAN frames but missing summary metadata"
                             );
                         }
@@ -567,64 +748,165 @@ fn spawn_can_runtime(
                         let timestamp = summary.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
                         info!(
                             interface = %interface,
+                            health_status = status.as_str(),
+                            stale_after_secs = stale_after_secs,
                             total_frames = total_frames,
+                            unknown_frames = unknown_frames,
                             last_frame_timestamp = %timestamp,
                             "No CAN frames received in the last 10s"
                         );
-
-                        if let Some(manager) = redis_manager.clone() {
-                            if let Err(err) = update_connection_status(
-                                &manager,
-                                &bus_state,
-                                "Connected",
-                                Some(summary.timestamp),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    interface = %interface,
-                                    error = %err,
-                                    "Failed to refresh connection status"
-                                );
-                            }
-                        }
                     } else {
                         info!(
                             interface = %interface,
+                            health_status = status.as_str(),
+                            stale_after_secs = stale_after_secs,
                             "No CAN frames received yet on this interface"
                         );
-
-                        if let Some(manager) = redis_manager.clone() {
-                            if let Err(err) = update_connection_status(
-                                &manager,
-                                &bus_state,
-                                "Connected",
-                                None,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    interface = %interface,
-                                    error = %err,
-                                    "Failed to refresh connection status"
-                                );
-                            }
-                        }
                     }
                 }
             }
         }
 
-        if let Some(manager) = redis_manager {
-            if let Err(err) =
-                update_connection_status(&manager, &bus_state, "Disconnected", last_online).await
-            {
-                warn!(
-                    interface = %interface,
-                    error = %err,
-                    "Failed to publish disconnect status"
-                );
-            }
-        }
+        let snapshot = ConnectionStatusSnapshot {
+            status: CanHealthStatus::Disconnected,
+            reason: "can_runtime_stopped",
+            now: Utc::now(),
+            last_frame_at,
+            total_frames,
+            interface,
+        };
+        publish_connection_status(
+            redis_manager.as_ref(),
+            &mqtt_service,
+            &bus_state,
+            &snapshot,
+            true,
+            true,
+        )
+        .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn test_time(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).single().unwrap()
+    }
+
+    #[test]
+    fn auto_invalidation_interval_defaults_when_missing_or_zero() {
+        assert_eq!(
+            normalize_auto_invalidation_interval(None),
+            DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS
+        );
+        assert_eq!(
+            normalize_auto_invalidation_interval(Some(0)),
+            DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS
+        );
+        assert_eq!(normalize_auto_invalidation_interval(Some(45)), 45);
+    }
+
+    #[test]
+    fn no_frame_waits_for_data_before_any_inbound_can_frame() {
+        let now = test_time(100);
+
+        assert_eq!(
+            health_status_for_frame_age(now, None, ChronoDuration::seconds(30)),
+            CanHealthStatus::WaitingForData
+        );
+    }
+
+    #[test]
+    fn fresh_frame_is_connected_until_stale_threshold_expires() {
+        let last_frame = test_time(100);
+
+        assert_eq!(
+            health_status_for_frame_age(
+                test_time(130),
+                Some(last_frame),
+                ChronoDuration::seconds(30)
+            ),
+            CanHealthStatus::Connected
+        );
+        assert_eq!(
+            health_status_for_frame_age(
+                test_time(131),
+                Some(last_frame),
+                ChronoDuration::seconds(30)
+            ),
+            CanHealthStatus::Stale
+        );
+    }
+
+    #[test]
+    fn new_inbound_frame_after_stale_recovers_to_connected() {
+        let now = test_time(200);
+
+        assert_eq!(
+            health_status_for_frame_age(now, Some(now), ChronoDuration::seconds(30)),
+            CanHealthStatus::Connected
+        );
+    }
+
+    #[test]
+    fn outbound_activity_does_not_refresh_inbound_health() {
+        let last_inbound_frame = test_time(100);
+        let outbound_tx_time = test_time(160);
+
+        assert_eq!(
+            health_status_for_frame_age(
+                outbound_tx_time,
+                Some(last_inbound_frame),
+                ChronoDuration::seconds(30)
+            ),
+            CanHealthStatus::Stale
+        );
+    }
+
+    #[test]
+    fn connection_status_payload_omits_last_online_until_real_frame_arrives() {
+        let snapshot = ConnectionStatusSnapshot {
+            status: CanHealthStatus::WaitingForData,
+            reason: "socket_opened",
+            now: test_time(100),
+            last_frame_at: None,
+            total_frames: 0,
+            interface: "can0".into(),
+        };
+
+        let payload = connection_status_payload(&snapshot);
+        let object = payload.as_object().unwrap();
+
+        assert_eq!(object["connection_status"], json!("WaitingForData"));
+        assert_eq!(object["status"], json!("WaitingForData"));
+        assert_eq!(object["reason"], json!("socket_opened"));
+        assert_eq!(object["interface"], json!("can0"));
+        assert_eq!(object["total_frames"], json!(0));
+        assert_eq!(object["last_frame_at"], JsonValue::Null);
+        assert_eq!(object["frame_age_ms"], JsonValue::Null);
+        assert!(!object.contains_key("last_online"));
+    }
+
+    #[test]
+    fn connection_status_payload_includes_frame_freshness_metadata() {
+        let snapshot = ConnectionStatusSnapshot {
+            status: CanHealthStatus::Connected,
+            reason: "first_can_frame",
+            now: test_time(105),
+            last_frame_at: Some(test_time(100)),
+            total_frames: 12,
+            interface: "can0".into(),
+        };
+
+        let payload = connection_status_payload(&snapshot);
+        let object = payload.as_object().unwrap();
+
+        assert_eq!(object["connection_status"], json!("Connected"));
+        assert_eq!(object["last_online"], object["last_frame_at"]);
+        assert_eq!(object["frame_age_ms"], json!(5000));
+        assert_eq!(object["total_frames"], json!(12));
+    }
 }
