@@ -291,10 +291,10 @@ fn collect_interface_bitrates(mappings: &[&HardwareMapping]) -> Result<Vec<(Stri
     let mut configured = HashMap::new();
 
     for mapping in mappings {
-        let interface = mapping.controller.clone();
+        let interface = mapping.controller.as_str();
         let bitrate = mapping.bitrate();
 
-        if configured.insert(interface.clone(), bitrate).is_some() {
+        if configured.insert(interface.to_string(), bitrate).is_some() {
             anyhow::bail!(
                 "Duplicate controller '{}' found in config.toml; each controller must be defined only once",
                 interface
