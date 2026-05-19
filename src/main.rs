@@ -303,7 +303,7 @@ fn collect_interface_bitrates(mappings: &[&HardwareMapping]) -> Result<Vec<(Stri
         let interface = mapping.controller.as_str();
         if !is_valid_controller_name(interface) {
             anyhow::bail!(
-                "Invalid controller '{}' in config.toml; expected Linux interface name characters [A-Za-z0-9_.-], max length 15, and must not start with '-'",
+                "Invalid controller '{}' in config.toml; controller names for this service may contain only ASCII letters, digits, '_', '-', and '.', must be at most 15 characters, and must not start with '-'",
                 interface
             );
         }
