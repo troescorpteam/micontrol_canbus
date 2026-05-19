@@ -287,10 +287,11 @@ fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_CAN_BITRATE)
 }
 
-fn run_ip_link(args: &[String]) -> Result<()> {
-    let output = Command::new("ip")
+async fn run_ip_link(args: &[String]) -> Result<()> {
+    let output = tokio::process::Command::new("ip")
         .args(args)
         .output()
+        .await
         .with_context(|| format!("failed to run ip {}", args.join(" ")))?;
 
     if output.status.success() {
