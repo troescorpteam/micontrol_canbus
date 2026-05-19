@@ -5,3 +5,4 @@ protocol = "CANBUS"
 hardware_type = "bams"
 hardware_id = "1"
 auto_invalidation_interval = 30
+bitrate = 125000

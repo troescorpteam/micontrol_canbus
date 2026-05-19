@@ -14,6 +14,7 @@ use socketcan::{CanFrame, EmbeddedFrame, Id, tokio::CanSocket};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -29,6 +30,7 @@ mod mqtt_integration;
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 const CONNECTIONS_HASH: &str = "connections";
 const DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CAN_BITRATE: u32 = 125_000;
 const CAN_ACTIVITY_LOG_INTERVAL_SECS: u64 = 10;
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,6 +52,8 @@ struct HardwareMapping {
     hardware_id: Option<String>,
     #[serde(default)]
     auto_invalidation_interval: Option<u64>,
+    #[serde(default, alias = "can_bitrate")]
+    bitrate: Option<u32>,
 }
 
 impl AppConfig {
@@ -84,6 +88,10 @@ impl HardwareMapping {
 
     fn stale_after_secs(&self) -> u64 {
         normalize_auto_invalidation_interval(self.auto_invalidation_interval)
+    }
+
+    fn bitrate(&self) -> u32 {
+        normalize_can_bitrate(self.bitrate)
     }
 }
 
@@ -126,12 +134,16 @@ async fn main() -> Result<()> {
 
     for mapping in mappings_to_run {
         let interface = mapping.controller.clone();
+        let bitrate = mapping.bitrate();
         let dbc_path = mapping.dbc().ok_or_else(|| {
             anyhow::anyhow!(
                 "No DBC file specified for controller '{}' in config.toml",
                 mapping.controller
             )
         })?;
+
+        info!(interface = %interface, bitrate, "Configuring CAN interface bitrate");
+        configure_can_interface(&interface, bitrate)?;
 
         info!(
             interface = %interface,
@@ -267,6 +279,39 @@ fn normalize_auto_invalidation_interval(configured: Option<u64>) -> u64 {
     configured
         .filter(|interval| *interval > 0)
         .unwrap_or(DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS)
+}
+
+fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
+    configured
+        .filter(|bitrate| *bitrate > 0)
+        .unwrap_or(DEFAULT_CAN_BITRATE)
+}
+
+fn run_ip_link(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run ip {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "ip {} failed with status {}: {}",
+        args.join(" "),
+        output.status,
+        stderr
+    );
+}
+
+fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
+    let bitrate_str = bitrate.to_string();
+    run_ip_link(&["link", "set", interface, "down"])?;
+    run_ip_link(&["link", "set", interface, "type", "can", "bitrate", &bitrate_str])?;
+    run_ip_link(&["link", "set", interface, "up"])?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,6 +852,13 @@ mod tests {
             DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS
         );
         assert_eq!(normalize_auto_invalidation_interval(Some(45)), 45);
+    }
+
+    #[test]
+    fn can_bitrate_defaults_when_missing_or_zero() {
+        assert_eq!(normalize_can_bitrate(None), DEFAULT_CAN_BITRATE);
+        assert_eq!(normalize_can_bitrate(Some(0)), DEFAULT_CAN_BITRATE);
+        assert_eq!(normalize_can_bitrate(Some(500_000)), 500_000);
     }
 
     #[test]
