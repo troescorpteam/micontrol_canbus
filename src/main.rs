@@ -1004,6 +1004,17 @@ mod tests {
     }
 
     #[test]
+    fn controller_name_validation_covers_edge_cases() {
+        assert!(is_valid_controller_name("can0"));
+        assert!(is_valid_controller_name("can0.100"));
+        assert!(!is_valid_controller_name(""));
+        assert!(!is_valid_controller_name("-can0"));
+        assert!(!is_valid_controller_name("can 0"));
+        assert!(!is_valid_controller_name("can0@"));
+        assert!(!is_valid_controller_name("can0123456789012"));
+    }
+
+    #[test]
     fn no_frame_waits_for_data_before_any_inbound_can_frame() {
         let now = test_time(100);
 
