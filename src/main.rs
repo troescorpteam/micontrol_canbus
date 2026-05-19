@@ -14,7 +14,6 @@ use socketcan::{CanFrame, EmbeddedFrame, Id, tokio::CanSocket};
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -132,18 +131,19 @@ async fn main() -> Result<()> {
     let bus_manager = Arc::new(BusManager::new());
     let mqtt_service = Arc::new(mqtt_integration::MqttService::new());
 
+    for (interface, bitrate) in collect_interface_bitrates(&mappings_to_run)? {
+        info!(interface = %interface, bitrate, "Configuring CAN interface bitrate");
+        configure_can_interface(&interface, bitrate).await?;
+    }
+
     for mapping in mappings_to_run {
         let interface = mapping.controller.clone();
-        let bitrate = mapping.bitrate();
         let dbc_path = mapping.dbc().ok_or_else(|| {
             anyhow::anyhow!(
                 "No DBC file specified for controller '{}' in config.toml",
                 mapping.controller
             )
         })?;
-
-        info!(interface = %interface, bitrate, "Configuring CAN interface bitrate");
-        configure_can_interface(&interface, bitrate)?;
 
         info!(
             interface = %interface,
@@ -287,6 +287,24 @@ fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_CAN_BITRATE)
 }
 
+fn collect_interface_bitrates(mappings: &[&HardwareMapping]) -> Result<Vec<(String, u32)>> {
+    let mut configured = HashMap::new();
+
+    for mapping in mappings {
+        let interface = mapping.controller.clone();
+        let bitrate = mapping.bitrate();
+
+        if configured.insert(interface.clone(), bitrate).is_some() {
+            anyhow::bail!(
+                "Duplicate controller '{}' found in config.toml; each controller must be defined only once",
+                interface
+            );
+        }
+    }
+
+    Ok(configured.into_iter().collect())
+}
+
 async fn run_ip_link(args: &[String]) -> Result<()> {
     let output = tokio::process::Command::new("ip")
         .args(args)
@@ -323,15 +341,15 @@ fn can_interface_setup_steps(interface: &str, bitrate: u32) -> [Vec<String>; 3] 
     ]
 }
 
-fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
+async fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
     let mut interface_brought_down = false;
 
     for step in can_interface_setup_steps(interface, bitrate) {
-        if let Err(err) = run_ip_link(&step) {
+        if let Err(err) = run_ip_link(&step).await {
             if interface_brought_down {
                 let cleanup_step =
                     vec!["link".into(), "set".into(), interface.into(), "up".into()];
-                let _ = run_ip_link(&cleanup_step);
+                let _ = run_ip_link(&cleanup_step).await;
             }
             return Err(err);
         }
@@ -929,6 +947,32 @@ mod tests {
                 "up".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn collect_interface_bitrates_rejects_duplicate_controllers() {
+        let first = HardwareMapping {
+            hardware_configurations: vec!["epc-2".to_string()],
+            controller: "can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(125_000),
+        };
+        let second = HardwareMapping {
+            hardware_configurations: vec!["epc-3".to_string()],
+            controller: "can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(500_000),
+        };
+
+        let mappings = vec![&first, &second];
+        let err = collect_interface_bitrates(&mappings).unwrap_err().to_string();
+        assert!(err.contains("Duplicate controller 'can0'"));
     }
 
     #[test]
