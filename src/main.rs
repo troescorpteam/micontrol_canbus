@@ -287,11 +287,27 @@ fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_CAN_BITRATE)
 }
 
+fn is_valid_controller_name(interface: &str) -> bool {
+    !interface.is_empty()
+        && !interface.starts_with('-')
+        && interface.len() <= 15
+        && interface
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 fn collect_interface_bitrates(mappings: &[&HardwareMapping]) -> Result<Vec<(String, u32)>> {
     let mut configured = HashMap::new();
 
     for mapping in mappings {
         let interface = mapping.controller.as_str();
+        if !is_valid_controller_name(interface) {
+            anyhow::bail!(
+                "Invalid controller '{}' in config.toml; expected Linux interface name characters [A-Za-z0-9_.-], max length 15, and must not start with '-'",
+                interface
+            );
+        }
+
         let bitrate = mapping.bitrate();
 
         if configured.insert(interface.to_string(), bitrate).is_some() {
@@ -344,7 +360,7 @@ fn can_interface_setup_steps(interface: &str, bitrate: u32) -> [Vec<String>; 3] 
 async fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
     let mut interface_brought_down = false;
 
-    for step in can_interface_setup_steps(interface, bitrate) {
+    for (index, step) in can_interface_setup_steps(interface, bitrate).into_iter().enumerate() {
         if let Err(err) = run_ip_link(&step).await {
             if interface_brought_down {
                 let cleanup_step =
@@ -354,12 +370,7 @@ async fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
             return Err(err);
         }
 
-        if step.len() == 4
-            && step[0] == "link"
-            && step[1] == "set"
-            && step[2] == interface
-            && step[3] == "down"
-        {
+        if index == 0 {
             interface_brought_down = true;
         }
     }
@@ -973,6 +984,23 @@ mod tests {
         let mappings = vec![&first, &second];
         let err = collect_interface_bitrates(&mappings).unwrap_err().to_string();
         assert!(err.contains("Duplicate controller 'can0'"));
+    }
+
+    #[test]
+    fn collect_interface_bitrates_rejects_invalid_controller_names() {
+        let invalid = HardwareMapping {
+            hardware_configurations: vec!["epc-2".to_string()],
+            controller: "-can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(125_000),
+        };
+
+        let mappings = vec![&invalid];
+        let err = collect_interface_bitrates(&mappings).unwrap_err().to_string();
+        assert!(err.contains("Invalid controller '-can0'"));
     }
 
     #[test]
