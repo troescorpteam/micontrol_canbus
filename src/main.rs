@@ -324,9 +324,28 @@ fn can_interface_setup_steps(interface: &str, bitrate: u32) -> [Vec<String>; 3] 
 }
 
 fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
+    let mut interface_brought_down = false;
+
     for step in can_interface_setup_steps(interface, bitrate) {
-        run_ip_link(&step)?;
+        if let Err(err) = run_ip_link(&step) {
+            if interface_brought_down {
+                let cleanup_step =
+                    vec!["link".into(), "set".into(), interface.into(), "up".into()];
+                let _ = run_ip_link(&cleanup_step);
+            }
+            return Err(err);
+        }
+
+        if step.len() == 4
+            && step[0] == "link"
+            && step[1] == "set"
+            && step[2] == interface
+            && step[3] == "down"
+        {
+            interface_brought_down = true;
+        }
     }
+
     Ok(())
 }
 
