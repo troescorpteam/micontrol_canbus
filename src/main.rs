@@ -29,6 +29,7 @@ mod mqtt_integration;
 const EFF_FLAG: u32 = 0x80000000; // Extended Frame Format flag
 const CONNECTIONS_HASH: &str = "connections";
 const DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CAN_BITRATE: u32 = 125_000;
 const CAN_ACTIVITY_LOG_INTERVAL_SECS: u64 = 10;
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,6 +51,8 @@ struct HardwareMapping {
     hardware_id: Option<String>,
     #[serde(default)]
     auto_invalidation_interval: Option<u64>,
+    #[serde(default, alias = "can_bitrate")]
+    bitrate: Option<u32>,
 }
 
 impl AppConfig {
@@ -84,6 +87,10 @@ impl HardwareMapping {
 
     fn stale_after_secs(&self) -> u64 {
         normalize_auto_invalidation_interval(self.auto_invalidation_interval)
+    }
+
+    fn bitrate(&self) -> u32 {
+        normalize_can_bitrate(self.bitrate)
     }
 }
 
@@ -123,6 +130,11 @@ async fn main() -> Result<()> {
 
     let bus_manager = Arc::new(BusManager::new());
     let mqtt_service = Arc::new(mqtt_integration::MqttService::new());
+
+    for (interface, bitrate) in collect_interface_bitrates(&mappings_to_run)? {
+        info!(interface = %interface, bitrate, "Configuring CAN interface bitrate");
+        configure_can_interface(&interface, bitrate).await?;
+    }
 
     for mapping in mappings_to_run {
         let interface = mapping.controller.clone();
@@ -267,6 +279,103 @@ fn normalize_auto_invalidation_interval(configured: Option<u64>) -> u64 {
     configured
         .filter(|interval| *interval > 0)
         .unwrap_or(DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS)
+}
+
+fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
+    configured
+        .filter(|bitrate| *bitrate > 0)
+        .unwrap_or(DEFAULT_CAN_BITRATE)
+}
+
+fn is_valid_controller_name(interface: &str) -> bool {
+    !interface.is_empty()
+        && !interface.starts_with('-')
+        && interface.len() <= 15
+        && interface
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn collect_interface_bitrates(mappings: &[&HardwareMapping]) -> Result<Vec<(String, u32)>> {
+    let mut configured = HashMap::new();
+
+    for mapping in mappings {
+        let interface = mapping.controller.as_str();
+        if !is_valid_controller_name(interface) {
+            anyhow::bail!(
+                "Invalid controller '{}' in config.toml; controller names for this service may contain only ASCII letters, digits, '_', '-', and '.', must be at most 15 characters, and must not start with '-'",
+                interface
+            );
+        }
+
+        let bitrate = mapping.bitrate();
+
+        if configured.insert(interface.to_string(), bitrate).is_some() {
+            anyhow::bail!(
+                "Duplicate controller '{}' found in config.toml; each controller must be defined only once",
+                interface
+            );
+        }
+    }
+
+    Ok(configured.into_iter().collect())
+}
+
+async fn run_ip_link(args: &[String]) -> Result<()> {
+    let output = tokio::process::Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to run ip {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "ip {} failed with status {}: {}",
+        args.join(" "),
+        output.status,
+        stderr
+    );
+}
+
+fn can_interface_setup_steps(interface: &str, bitrate: u32) -> [Vec<String>; 3] {
+    [
+        vec!["link".into(), "set".into(), interface.into(), "down".into()],
+        vec![
+            "link".into(),
+            "set".into(),
+            interface.into(),
+            "type".into(),
+            "can".into(),
+            "bitrate".into(),
+            bitrate.to_string(),
+        ],
+        vec!["link".into(), "set".into(), interface.into(), "up".into()],
+    ]
+}
+
+async fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
+    let mut interface_brought_down = false;
+
+    for (index, step) in can_interface_setup_steps(interface, bitrate).into_iter().enumerate() {
+        if let Err(err) = run_ip_link(&step).await {
+            if interface_brought_down {
+                let cleanup_step =
+                    vec!["link".into(), "set".into(), interface.into(), "up".into()];
+                let _ = run_ip_link(&cleanup_step).await;
+            }
+            return Err(err);
+        }
+
+        if index == 0 {
+            interface_brought_down = true;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,6 +916,102 @@ mod tests {
             DEFAULT_AUTO_INVALIDATION_INTERVAL_SECS
         );
         assert_eq!(normalize_auto_invalidation_interval(Some(45)), 45);
+    }
+
+    #[test]
+    fn can_bitrate_defaults_when_missing_or_zero() {
+        assert_eq!(normalize_can_bitrate(None), DEFAULT_CAN_BITRATE);
+        assert_eq!(normalize_can_bitrate(Some(0)), DEFAULT_CAN_BITRATE);
+        assert_eq!(normalize_can_bitrate(Some(500_000)), 500_000);
+    }
+
+    #[test]
+    fn can_interface_setup_steps_match_expected_ip_link_sequence() {
+        let steps = can_interface_setup_steps("can0", 125_000);
+        assert_eq!(
+            steps[0],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "down".to_string()
+            ]
+        );
+        assert_eq!(
+            steps[1],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "type".to_string(),
+                "can".to_string(),
+                "bitrate".to_string(),
+                "125000".to_string()
+            ]
+        );
+        assert_eq!(
+            steps[2],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "up".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_interface_bitrates_rejects_duplicate_controllers() {
+        let first = HardwareMapping {
+            hardware_configurations: vec!["epc-2".to_string()],
+            controller: "can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(125_000),
+        };
+        let second = HardwareMapping {
+            hardware_configurations: vec!["epc-3".to_string()],
+            controller: "can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(500_000),
+        };
+
+        let mappings = vec![&first, &second];
+        let err = collect_interface_bitrates(&mappings).unwrap_err().to_string();
+        assert!(err.contains("Duplicate controller 'can0'"));
+    }
+
+    #[test]
+    fn collect_interface_bitrates_rejects_invalid_controller_names() {
+        let invalid = HardwareMapping {
+            hardware_configurations: vec!["epc-2".to_string()],
+            controller: "-can0".to_string(),
+            protocol: None,
+            hardware_type: None,
+            hardware_id: None,
+            auto_invalidation_interval: None,
+            bitrate: Some(125_000),
+        };
+
+        let mappings = vec![&invalid];
+        let err = collect_interface_bitrates(&mappings).unwrap_err().to_string();
+        assert!(err.contains("Invalid controller '-can0'"));
+    }
+
+    #[test]
+    fn controller_name_validation_covers_edge_cases() {
+        assert!(is_valid_controller_name("can0"));
+        assert!(is_valid_controller_name("can0.100"));
+        assert!(!is_valid_controller_name(""));
+        assert!(!is_valid_controller_name("-can0"));
+        assert!(!is_valid_controller_name("can 0"));
+        assert!(!is_valid_controller_name("can0@"));
+        assert!(!is_valid_controller_name("can0123456789012"));
     }
 
     #[test]

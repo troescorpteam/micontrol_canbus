@@ -51,6 +51,7 @@ The service expects:
 [[hardware_mappings]]
 hardware_configurations = ["epc-2"] # can be ["name"] or ["name.dbc"]
 controller = "can0"
+bitrate = 125000
 protocol = "CANBUS"
 hardware_type = "bams"
 hardware_id = "1"
@@ -59,7 +60,13 @@ auto_invalidation_interval = 30
 
 Notes:
 
-- `controller` is required and is used as the CAN interface name (e.g. `can0`, `vcan0`).
+- `controller` is required and is used as the CAN interface name (e.g. `can0`).
+- `bitrate` sets the CAN interface bitrate in bps. At startup the service runs:
+  - `ip link set <controller> down`
+  - `ip link set <controller> type can bitrate <bitrate>`
+  - `ip link set <controller> up`
+  Defaults to `125000` when missing or set to `0`.
+  `vcan` interfaces are not supported by this automatic bitrate setup.
 - DBC resolution from `hardware_configurations`:
   - If an entry already ends with `.dbc`, it is used directly.
   - Otherwise `<entry>.dbc` is tried.
@@ -180,9 +187,11 @@ Using Cargo locally:
 
 ## Running locally
 
-1. Configure CAN interface (example helper script):
-   - `sudo ./python_test/reset_can_interface.sh`
-   - `sudo` is required because bringing network interfaces down/up needs elevated privileges.
+1. Ensure the process has permissions to configure CAN interfaces:
+   - The service sets `controller` bitrate from `config.toml` at startup (`ip link set ...`).
+   - This typically requires running with `sudo`/root capabilities.
+   - Use a real SocketCAN interface (for example `can0`), not `vcan0`, because `ip link ... type can bitrate ...` does not apply to `vcan`.
+   - Optional helper script: `sudo ./python_test/reset_can_interface.sh`
 2. Configure environment:
    - `cp .env.example .env`
    - add MQTT and SYSTEM_NAME values as needed
