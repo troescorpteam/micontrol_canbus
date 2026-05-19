@@ -287,7 +287,7 @@ fn normalize_can_bitrate(configured: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_CAN_BITRATE)
 }
 
-fn run_ip_link(args: &[&str]) -> Result<()> {
+fn run_ip_link(args: &[String]) -> Result<()> {
     let output = Command::new("ip")
         .args(args)
         .output()
@@ -306,11 +306,26 @@ fn run_ip_link(args: &[&str]) -> Result<()> {
     );
 }
 
+fn can_interface_setup_steps(interface: &str, bitrate: u32) -> [Vec<String>; 3] {
+    [
+        vec!["link".into(), "set".into(), interface.into(), "down".into()],
+        vec![
+            "link".into(),
+            "set".into(),
+            interface.into(),
+            "type".into(),
+            "can".into(),
+            "bitrate".into(),
+            bitrate.to_string(),
+        ],
+        vec!["link".into(), "set".into(), interface.into(), "up".into()],
+    ]
+}
+
 fn configure_can_interface(interface: &str, bitrate: u32) -> Result<()> {
-    let bitrate_str = bitrate.to_string();
-    run_ip_link(&["link", "set", interface, "down"])?;
-    run_ip_link(&["link", "set", interface, "type", "can", "bitrate", &bitrate_str])?;
-    run_ip_link(&["link", "set", interface, "up"])?;
+    for step in can_interface_setup_steps(interface, bitrate) {
+        run_ip_link(&step)?;
+    }
     Ok(())
 }
 
@@ -859,6 +874,41 @@ mod tests {
         assert_eq!(normalize_can_bitrate(None), DEFAULT_CAN_BITRATE);
         assert_eq!(normalize_can_bitrate(Some(0)), DEFAULT_CAN_BITRATE);
         assert_eq!(normalize_can_bitrate(Some(500_000)), 500_000);
+    }
+
+    #[test]
+    fn can_interface_setup_steps_match_expected_ip_link_sequence() {
+        let steps = can_interface_setup_steps("can0", 125_000);
+        assert_eq!(
+            steps[0],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "down".to_string()
+            ]
+        );
+        assert_eq!(
+            steps[1],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "type".to_string(),
+                "can".to_string(),
+                "bitrate".to_string(),
+                "125000".to_string()
+            ]
+        );
+        assert_eq!(
+            steps[2],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                "can0".to_string(),
+                "up".to_string()
+            ]
+        );
     }
 
     #[test]

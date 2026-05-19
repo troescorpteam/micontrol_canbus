@@ -65,7 +65,7 @@ Notes:
   - `ip link set <controller> down`
   - `ip link set <controller> type can bitrate <bitrate>`
   - `ip link set <controller> up`
-  Missing or `0` values default to `125000`.
+  Defaults to `125000` when missing or set to `0`.
 - DBC resolution from `hardware_configurations`:
   - If an entry already ends with `.dbc`, it is used directly.
   - Otherwise `<entry>.dbc` is tried.
